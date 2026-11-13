@@ -106,7 +106,9 @@ func CheckQueueAttributes(attrs, current map[string]string, fifo bool) (map[stri
 			v, err = checkRedrivePolicy(v)
 		case contracts.AttrRedriveAllowPolicy:
 			v, err = checkRedriveAllowPolicy(v)
-		case contracts.AttrPolicy, contracts.AttrKmsMasterKeyID:
+		case contracts.AttrPolicy:
+			err = checkPolicy(v)
+		case contracts.AttrKmsMasterKeyID:
 		default:
 			v, err = checkInt(name, v, intAttributes[name])
 		}
@@ -125,6 +127,22 @@ func CheckQueueAttributes(attrs, current map[string]string, fifo bool) (map[stri
 				"DeduplicationScope is messageGroup.")
 	}
 	return out, nil
+}
+
+// checkPolicy checks a Policy, "" removing it, as contracts.CheckPolicy
+// does. Every fault, the quotas included, is InvalidAttributeValue: the
+// error SQS documents for "an incorrect policy or a principal"
+// ("Troubleshoot Amazon SQS API errors", SQS Developer Guide); CreateQueue
+// lists no OverLimit. The reason is the parser's message, or the quota
+// exceeded; SQS's own wording is not documented.
+func checkPolicy(v string) error {
+	if v == "" {
+		return nil
+	}
+	if pe := contracts.CheckPolicy(v); pe != nil {
+		return ErrInvalidAttributeValue(contracts.AttrPolicy, pe.Reason)
+	}
+	return nil
 }
 
 func checkInt(name, v string, r intRange) (string, error) {
