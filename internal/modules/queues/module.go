@@ -34,6 +34,9 @@ const (
 type Module struct {
 	router     *gas.Router
 	authorizer *authz.Authorizer
+	// principals binds and shows the queue policies' principals, nil when
+	// the service runs standalone.
+	principals contracts.PolicyPrincipals
 	store      contracts.QueueProvider
 	settings   *contracts.QueueSettings
 	handlers   map[string]handler
@@ -73,12 +76,16 @@ func (c *call) Value(key any) any {
 
 // NewModule returns the constructor gas uses to build a Module serving the
 // queues of settings' account from store, authorizing each request with
-// authorizer.
-func NewModule(settings *contracts.QueueSettings, authorizer *authz.Authorizer) func(
-	router *gas.Router, store contracts.QueueProvider,
-) *Module {
+// authorizer, and binding and showing the queue policies' principals with
+// principals, nil to store and show them as sent (standalone).
+func NewModule(settings *contracts.QueueSettings, authorizer *authz.Authorizer,
+	principals contracts.PolicyPrincipals,
+) func(router *gas.Router, store contracts.QueueProvider) *Module {
 	return func(router *gas.Router, store contracts.QueueProvider) *Module {
-		m := &Module{router: router, store: store, settings: settings, authorizer: authorizer}
+		m := &Module{
+			router: router, store: store, settings: settings, authorizer: authorizer,
+			principals: principals,
+		}
 		m.handlers = map[string]handler{
 			"CreateQueue":                  m.createQueue,
 			"DeleteQueue":                  m.deleteQueue,
