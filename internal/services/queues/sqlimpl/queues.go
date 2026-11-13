@@ -542,24 +542,22 @@ func (s *Service) UntagQueue(ctx context.Context, name string, keys []string) er
 
 // ListQueueTags returns the queue's tags.
 func (s *Service) ListQueueTags(ctx context.Context, name string) (map[string]string, error) {
-	_, tags, err := s.QueueTags(ctx, name)
-	return tags, err
+	a, err := s.QueueAccess(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return a.Tags, nil
 }
 
-// QueueTags returns the queue's ID and tags, read in one transaction.
-func (s *Service) QueueTags(
-	ctx context.Context, name string,
-) (contracts.QueueID, map[string]string, error) {
-	var (
-		out map[string]string
-		id  contracts.QueueID
-	)
+// QueueAccess returns the queue's ID, tags and Policy, read in one
+// transaction.
+func (s *Service) QueueAccess(ctx context.Context, name string) (*contracts.QueueAccess, error) {
+	var out *contracts.QueueAccess
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		q, err := loadQueue(ctx, tx, name)
 		if err != nil {
 			return err
 		}
-		id = contracts.QueueID(q.id)
 		type tag struct{ k, v string }
 		tags, err := queryAll(ctx, tx, func(r scanner) (tag, error) {
 			var t tag
@@ -569,13 +567,16 @@ func (s *Service) QueueTags(
 		if err != nil {
 			return err
 		}
-		out = make(map[string]string, len(tags))
+		out = &contracts.QueueAccess{
+			ID: contracts.QueueID(q.id), Policy: q.attrs[contracts.AttrPolicy],
+			Tags: make(map[string]string, len(tags)),
+		}
 		for _, t := range tags {
-			out[t.k] = t.v
+			out.Tags[t.k] = t.v
 		}
 		return nil
 	})
-	return id, out, err
+	return out, err
 }
 
 // ListDeadLetterSourceQueues lists, in order, the names of the queues whose

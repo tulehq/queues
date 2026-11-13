@@ -11,13 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"tule.dev/policy"
 	"tule.dev/sigv4"
 )
 
 const (
 	userARN    = "arn:aws:iam::111122223333:user/team/dev"
 	sessionARN = "arn:aws:sts::111122223333:assumed-role/worker/job-1"
+	roleARN    = "arn:aws:iam::111122223333:role/jobs/worker"
 	queueARN   = "arn:aws:sqs:us-east-1:111122223333:orders"
+	rootARN    = "arn:aws:iam::111122223333:root"
 )
 
 var fixedNow = time.Date(2026, 11, 13, 10, 30, 0, 0, time.UTC)
@@ -26,8 +29,28 @@ func newAuthorizer() *Authorizer {
 	return New("111122223333", "us-east-1", func() time.Time { return fixedNow })
 }
 
+// principal is the principal of arn, an IAM user's, a role session's or
+// the root user's ARN, with the attributes identity's key source hands
+// over for it: a session's role is roleARN's when its account and name
+// match, else the role of its name at path /.
 func principal(arn string, docs ...string) sigv4.Principal {
-	p := sigv4.Principal{AccountID: "111122223333", ARN: arn, AccessKeyID: "AKIAEXAMPLE"}
+	account := strings.Split(arn, ":")[4]
+	p := sigv4.Principal{AccountID: account, ARN: arn, AccessKeyID: "AKIAEXAMPLE"}
+	switch {
+	case strings.HasSuffix(arn, ":root"):
+		p.Type, p.PrincipalARN, p.UserID = sigv4.PrincipalTypeAccount, arn, account
+		p.Root = true
+	case strings.Contains(arn, ":assumed-role/"):
+		parts := strings.Split(arn, "/")
+		p.Type = sigv4.PrincipalTypeAssumedRole
+		p.UserID = "AROAEXAMPLEROLEID01:" + parts[2]
+		p.PrincipalARN = "arn:aws:iam::" + account + ":role/" + parts[1]
+		if account == "111122223333" && parts[1] == "worker" {
+			p.PrincipalARN = roleARN
+		}
+	default:
+		p.Type, p.PrincipalARN, p.UserID = sigv4.PrincipalTypeUser, arn, "AIDAEXAMPLEUSERID01"
+	}
 	for _, d := range docs {
 		p.Policies = append(p.Policies, json.RawMessage(d))
 	}
@@ -49,7 +72,7 @@ func authorize(t *testing.T, a *Authorizer, p sigv4.Principal, checks ...Check) 
 	return a.Authorize(r, p, checks...)
 }
 
-func requireDenied(t *testing.T, err error, action, resource string, reason Reason) {
+func requireDenied(t *testing.T, err error, action, resource string, reason policy.Reason) {
 	t.Helper()
 	var d *Denied
 	if !errors.As(err, &d) {
@@ -61,7 +84,7 @@ func requireDenied(t *testing.T, err error, action, resource string, reason Reas
 }
 
 func TestARootPrincipalIsNeverEvaluated(t *testing.T) {
-	p := principal("arn:aws:iam::111122223333:root", deny("*", "*"))
+	p := principal(rootARN, deny("*", "*"))
 	p.Root = true
 	if err := authorize(
 		t,
@@ -76,7 +99,7 @@ func TestARootPrincipalIsNeverEvaluated(t *testing.T) {
 func TestAPrincipalWithoutPoliciesIsImplicitlyDenied(t *testing.T) {
 	err := authorize(t, newAuthorizer(), principal(userARN),
 		Check{Action: "sqs:SendMessage", Resource: queueARN})
-	requireDenied(t, err, "sqs:SendMessage", queueARN, NoIdentityAllow)
+	requireDenied(t, err, "sqs:SendMessage", queueARN, policy.NoIdentityAllow)
 }
 
 func TestAnAllowAllowsOnlyItsActionAndResource(t *testing.T) {
@@ -86,16 +109,16 @@ func TestAnAllowAllowsOnlyItsActionAndResource(t *testing.T) {
 		t.Fatalf("allowed check: %v", err)
 	}
 	err := authorize(t, a, p, Check{Action: "sqs:ReceiveMessage", Resource: queueARN})
-	requireDenied(t, err, "sqs:ReceiveMessage", queueARN, NoIdentityAllow)
+	requireDenied(t, err, "sqs:ReceiveMessage", queueARN, policy.NoIdentityAllow)
 	other := "arn:aws:sqs:us-east-1:111122223333:other"
 	err = authorize(t, a, p, Check{Action: "sqs:SendMessage", Resource: other})
-	requireDenied(t, err, "sqs:SendMessage", other, NoIdentityAllow)
+	requireDenied(t, err, "sqs:SendMessage", other, policy.NoIdentityAllow)
 }
 
 func TestAnExplicitDenyBeatsAnAllow(t *testing.T) {
 	p := principal(userARN, allow("sqs:*", "*"), deny("sqs:DeleteQueue", queueARN))
 	err := authorize(t, newAuthorizer(), p, Check{Action: "sqs:DeleteQueue", Resource: queueARN})
-	requireDenied(t, err, "sqs:DeleteQueue", queueARN, ExplicitDeny)
+	requireDenied(t, err, "sqs:DeleteQueue", queueARN, policy.IdentityDeny)
 }
 
 func TestEveryCheckMustBeAllowed(t *testing.T) {
@@ -103,7 +126,7 @@ func TestEveryCheckMustBeAllowed(t *testing.T) {
 	err := authorize(t, newAuthorizer(), p,
 		Check{Action: "sqs:CreateQueue", Resource: queueARN},
 		Check{Action: "sqs:TagQueue", Resource: queueARN})
-	requireDenied(t, err, "sqs:TagQueue", queueARN, NoIdentityAllow)
+	requireDenied(t, err, "sqs:TagQueue", queueARN, policy.NoIdentityAllow)
 }
 
 func TestACheckCarriesItsOwnContext(t *testing.T) {
@@ -119,7 +142,7 @@ func TestACheckCarriesItsOwnContext(t *testing.T) {
 	}
 	red := blue
 	red.Context = map[string][]string{"aws:RequestTag/team": {"red"}}
-	requireDenied(t, authorize(t, a, p, red), "sqs:TagQueue", queueARN, NoIdentityAllow)
+	requireDenied(t, authorize(t, a, p, red), "sqs:TagQueue", queueARN, policy.NoIdentityAllow)
 }
 
 func TestAnUnusablePolicyIsAFaultNotADenial(t *testing.T) {
@@ -162,23 +185,23 @@ func TestTheGlobalContextKeys(t *testing.T) {
 	r.RemoteAddr = "203.0.113.7:4567"
 	r.TLS = &tls.ConnectionState{}
 
-	ctx := a.Context(r, principal(userARN))
+	p := principal(userARN)
+	p.Tags = map[string]string{"Team": "blue"}
+	ctx := a.Context(r, p)
 	want := map[string]string{
-		"aws:SourceIp":         "203.0.113.7",
-		"aws:CurrentTime":      "2026-11-13T10:30:00Z",
-		"aws:EpochTime":        strconv.FormatInt(fixedNow.Unix(), 10),
-		"aws:SecureTransport":  "true",
-		"aws:PrincipalAccount": "111122223333",
-		"aws:PrincipalArn":     userARN,
-		"aws:PrincipalType":    "User",
-		"aws:username":         "dev",
-		"aws:RequestedRegion":  "us-east-1",
+		"aws:SourceIp":          "203.0.113.7",
+		"aws:CurrentTime":       "2026-11-13T10:30:00Z",
+		"aws:EpochTime":         strconv.FormatInt(fixedNow.Unix(), 10),
+		"aws:SecureTransport":   "true",
+		"aws:RequestedRegion":   "us-east-1",
+		"aws:PrincipalTag/Team": "blue",
 	}
 	for k, v := range want {
 		if got := ctx[k]; !slices.Equal(got, []string{v}) {
 			t.Errorf("%s = %q, want %q", k, got, v)
 		}
 	}
+	// The principal's own keys are Authorize's to supply, from the Caller.
 	if len(ctx) != len(want) {
 		t.Errorf("context has %d keys, want %d: %v", len(ctx), len(want), ctx)
 	}
@@ -192,30 +215,78 @@ func TestTheGlobalContextKeys(t *testing.T) {
 	}
 }
 
-func TestARoleSessionIsItsRoleWithoutAPath(t *testing.T) {
-	ctx := newAuthorizer().Context(httptest.NewRequest("POST", "/", nil), principal(sessionARN))
-	if got := ctx["aws:PrincipalArn"]; !slices.Equal(
-		got,
-		[]string{"arn:aws:iam::111122223333:role/worker"},
-	) {
-		t.Errorf("aws:PrincipalArn = %q", got)
+func TestTheCallerIsThePrincipalsAttributes(t *testing.T) {
+	p := principal(sessionARN)
+	want := policy.Caller{
+		AccountID: "111122223333", ARN: sessionARN, PrincipalARN: roleARN,
+		UserID: "AROAEXAMPLEROLEID01:job-1", Type: policy.PrincipalTypeAssumedRole,
 	}
-	if got := ctx["aws:PrincipalType"]; !slices.Equal(got, []string{"AssumedRole"}) {
-		t.Errorf("aws:PrincipalType = %q", got)
-	}
-	if _, ok := ctx["aws:username"]; ok {
-		t.Error("a role session has aws:username")
+	if got := Caller(p); got != want {
+		t.Fatalf("Caller = %+v, want %+v", got, want)
 	}
 }
 
-func TestTheRootUsersKeys(t *testing.T) {
-	ctx := newAuthorizer().Context(httptest.NewRequest("POST", "/", nil),
-		principal("arn:aws:iam::111122223333:root"))
-	if got := ctx["aws:userid"]; !slices.Equal(got, []string{"111122223333"}) {
-		t.Errorf("aws:userid = %q", got)
+// condition is an identity policy allowing sqs:SendMessage on every queue
+// when the condition holds.
+func condition(op, key, value string) string {
+	return `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sqs:SendMessage",
+		"Resource":"*","Condition":{"` + op + `":{"` + key + `":"` + value + `"}}}]}`
+}
+
+func TestARoleSessionsPrincipalArnHasItsRolesPath(t *testing.T) {
+	a := newAuthorizer()
+	send := Check{Action: "sqs:SendMessage", Resource: queueARN}
+	if err := authorize(t, a, principal(sessionARN,
+		condition("ArnLike", "aws:PrincipalArn", "arn:aws:iam::*:role/jobs/*")), send); err != nil {
+		t.Fatalf("a condition on the role's path: %v", err)
 	}
-	if got := ctx["aws:PrincipalType"]; !slices.Equal(got, []string{"Account"}) {
-		t.Errorf("aws:PrincipalType = %q", got)
+	requireDenied(t, authorize(t, a, principal(sessionARN,
+		condition("ArnEquals", "aws:PrincipalArn", "arn:aws:iam::111122223333:role/worker")), send),
+		"sqs:SendMessage", queueARN, policy.NoIdentityAllow)
+}
+
+func TestTheUsersKeysComeFromTheCaller(t *testing.T) {
+	a := newAuthorizer()
+	send := Check{Action: "sqs:SendMessage", Resource: queueARN}
+	for key, value := range map[string]string{
+		"aws:userid":           "AIDAEXAMPLEUSERID01",
+		"aws:PrincipalType":    "User",
+		"aws:PrincipalAccount": "111122223333",
+		"aws:username":         "dev",
+		"aws:PrincipalArn":     userARN,
+	} {
+		if err := authorize(t, a, principal(userARN, condition("StringEquals", key, value)),
+			send); err != nil {
+			t.Errorf("%s = %s: %v", key, value, err)
+		}
+	}
+	// A request's own context cannot set them.
+	forged := send
+	forged.Context = map[string][]string{"aws:username": {"admin"}}
+	requireDenied(t, authorize(t, a, principal(userARN,
+		condition("StringEquals", "aws:username", "admin")), forged),
+		"sqs:SendMessage", queueARN, policy.NoIdentityAllow)
+}
+
+func TestAPrincipalTagIsAConditionKey(t *testing.T) {
+	a := newAuthorizer()
+	send := Check{Action: "sqs:SendMessage", Resource: queueARN}
+	p := principal(userARN, condition("StringEquals", "aws:PrincipalTag/team", "blue"))
+	p.Tags = map[string]string{"Team": "blue"}
+	if err := authorize(t, a, p, send); err != nil {
+		t.Fatalf("a matching tag: %v", err)
+	}
+	p.Tags = map[string]string{"Team": "red"}
+	requireDenied(t, authorize(t, a, p, send), "sqs:SendMessage", queueARN,
+		policy.NoIdentityAllow)
+
+	// Keys differing only by case would feed one key: identity never hands
+	// them over, and they are not evaluated.
+	p.Tags = map[string]string{"Team": "blue", "team": "red"}
+	err := authorize(t, a, p, send)
+	var d *Denied
+	if !errors.Is(err, errPrincipal) || errors.As(err, &d) {
+		t.Fatalf("error = %v, want errPrincipal", err)
 	}
 }
 
@@ -229,16 +300,16 @@ func TestAPolicyVariableReadsTheUserName(t *testing.T) {
 		t.Fatalf("own queue: %v", err)
 	}
 	requireDenied(t, authorize(t, a, p, Check{Action: "sqs:SendMessage", Resource: queueARN}),
-		"sqs:SendMessage", queueARN, NoIdentityAllow)
+		"sqs:SendMessage", queueARN, policy.NoIdentityAllow)
 }
 
 func TestTheMessageForm(t *testing.T) {
-	if got, want := Message(userARN, "sqs:sendmessage", queueARN, NoIdentityAllow),
+	if got, want := Message(userARN, "sqs:sendmessage", queueARN, policy.NoIdentityAllow),
 		"User: "+userARN+" is not authorized to perform: sqs:sendmessage on resource: "+
 			queueARN+" because no identity-based policy allows the sqs:sendmessage action"; got != want {
 		t.Errorf("implicit:\n got %s\nwant %s", got, want)
 	}
-	if got, want := Message(userARN, "sqs:sendmessage", queueARN, ExplicitDeny),
+	if got, want := Message(userARN, "sqs:sendmessage", queueARN, policy.IdentityDeny),
 		"User: "+userARN+" is not authorized to perform: sqs:sendmessage on resource: "+
 			queueARN+" with an explicit deny in an identity-based policy"; got != want {
 		t.Errorf("explicit:\n got %s\nwant %s", got, want)
@@ -246,41 +317,141 @@ func TestTheMessageForm(t *testing.T) {
 }
 
 func TestTheResourceBasedMessageForm(t *testing.T) {
-	if got, want := Message(userARN, "sqs:sendmessage", queueARN, NoResourceAllow),
+	if got, want := Message(userARN, "sqs:sendmessage", queueARN, policy.NoResourceAllow),
 		"User: "+userARN+" is not authorized to perform: sqs:sendmessage on resource: "+
 			queueARN+" because no resource-based policy allows the sqs:sendmessage action"; got != want {
 		t.Errorf("resource-based:\n got %s\nwant %s", got, want)
 	}
 }
 
+const memberSessionARN = "arn:aws:sts::444455556666:assumed-role/OrganizationAccountAccessRole/e2e"
+
 // memberPrincipal is a principal of another account than the authorizer's.
 func memberPrincipal(docs ...string) sigv4.Principal {
-	p := principal("arn:aws:sts::444455556666:assumed-role/OrganizationAccountAccessRole/e2e",
-		docs...)
-	p.AccountID = "444455556666"
-	return p
+	return principal(memberSessionARN, docs...)
 }
 
-func TestAnotherAccountsPrincipalIsDenied(t *testing.T) {
+// queuePolicy parses a queue policy whose one statement has effect for
+// principal (a JSON value) on sqs:SendMessage of the queue.
+func queuePolicy(t *testing.T, effect, principal string) *policy.Policy {
+	t.Helper()
+	pol, err := newAuthorizer().ResourcePolicy(`{"Version":"2012-10-17","Statement":[{"Effect":"` +
+		effect + `","Principal":` + principal + `,"Action":"sqs:SendMessage","Resource":"` + queueARN + `"}]}`)
+	if err != nil {
+		t.Fatalf("queue policy: %v", err)
+	}
+	return pol
+}
+
+func TestAnotherAccountsPrincipalNeedsBothPolicies(t *testing.T) {
 	a := newAuthorizer()
 	check := Check{Action: "sqs:SendMessage", Resource: queueARN}
+	granted := check
+	granted.Policy = queuePolicy(t, "Allow", `{"AWS":"444455556666"}`)
 
-	// Allowed by its identity policies, it still needs a resource-based
-	// policy, which nothing here grants.
+	// Allowed by its identity policies, it still needs the queue policy.
 	requireDenied(t, authorize(t, a, memberPrincipal(allow("*", "*")), check),
-		"sqs:SendMessage", queueARN, NoResourceAllow)
-	// Its identity policies are evaluated first.
-	requireDenied(t, authorize(t, a, memberPrincipal(), check),
-		"sqs:SendMessage", queueARN, NoIdentityAllow)
-	requireDenied(t, authorize(t, a, memberPrincipal(allow("*", "*"), deny("sqs:*", "*")), check),
-		"sqs:SendMessage", queueARN, ExplicitDeny)
+		"sqs:SendMessage", queueARN, policy.NoResourceAllow)
+	if err := authorize(t, a, memberPrincipal(allow("*", "*")), granted); err != nil {
+		t.Fatalf("both policies allow: %v", err)
+	}
+	// And the queue policy alone is not enough.
+	requireDenied(t, authorize(t, a, memberPrincipal(), granted),
+		"sqs:SendMessage", queueARN, policy.NoIdentityAllow)
+	requireDenied(t, authorize(t, a, memberPrincipal(allow("*", "*"), deny("sqs:*", "*")), granted),
+		"sqs:SendMessage", queueARN, policy.IdentityDeny)
 
-	// Another account's root user is evaluated like any principal of that
-	// account, not let through as root.
-	root := memberPrincipal(allow("*", "*"))
-	root.Root = true
+	// Another account's root user is not root here; it has every
+	// identity-based permission in its account, and needs the grant.
+	root := principal("arn:aws:iam::444455556666:root")
 	if a.IsRoot(root) {
 		t.Fatal("another account's root principal is root here")
 	}
-	requireDenied(t, authorize(t, a, root, check), "sqs:SendMessage", queueARN, NoResourceAllow)
+	requireDenied(t, authorize(t, a, root, check), "sqs:SendMessage", queueARN,
+		policy.NoResourceAllow)
+	if err := authorize(t, a, root, granted); err != nil {
+		t.Fatalf("another account's root with the grant: %v", err)
+	}
+}
+
+func TestAQueuePolicyDenyBeatsAnIdentityAllow(t *testing.T) {
+	check := Check{
+		Action: "sqs:SendMessage", Resource: queueARN,
+		Policy: queuePolicy(t, "Deny", `"*"`),
+	}
+	requireDenied(t, authorize(t, newAuthorizer(), principal(userARN, allow("*", "*")), check),
+		"sqs:SendMessage", queueARN, policy.ResourceDeny)
+}
+
+func TestWithinTheAccountAQueuePolicyGrantsAUserDirectly(t *testing.T) {
+	a := newAuthorizer()
+	direct := Check{
+		Action: "sqs:SendMessage", Resource: queueARN,
+		Policy: queuePolicy(t, "Allow", `{"AWS":"`+userARN+`"}`),
+	}
+	if err := authorize(t, a, principal(userARN), direct); err != nil {
+		t.Fatalf("a grant naming the IAM user: %v", err)
+	}
+	// A grant to the account delegates to the account's own policies.
+	account := direct
+	account.Policy = queuePolicy(t, "Allow", `{"AWS":"`+rootARN+`"}`)
+	requireDenied(t, authorize(t, a, principal(userARN), account),
+		"sqs:SendMessage", queueARN, policy.NoIdentityAllow)
+	if err := authorize(t, a, principal(userARN, allow("sqs:SendMessage", "*")),
+		account); err != nil {
+		t.Fatalf("an account grant with the identity allow: %v", err)
+	}
+}
+
+func TestAGrantToARoleWithAPathReachesItsSessions(t *testing.T) {
+	a := newAuthorizer()
+	check := Check{
+		Action: "sqs:SendMessage", Resource: queueARN,
+		Policy: queuePolicy(t, "Allow", `{"AWS":"`+roleARN+`"}`),
+	}
+	if err := authorize(t, a, principal(sessionARN), check); err != nil {
+		t.Fatalf("a session of the role: %v", err)
+	}
+	// The session of a deleted role is no session of the role.
+	orphan := principal(sessionARN)
+	orphan.PrincipalARN = ""
+	requireDenied(t, authorize(t, a, orphan, check), "sqs:SendMessage", queueARN,
+		policy.NoIdentityAllow)
+}
+
+func TestAStoredQueuePolicyThatCannotBeEvaluatedFailsClosed(t *testing.T) {
+	a := newAuthorizer()
+	if pol, err := a.ResourcePolicy(""); pol != nil || err != nil {
+		t.Fatalf("no policy = %v, %v; want nil, nil", pol, err)
+	}
+	for name, doc := range map[string]string{
+		"malformed":         `{"Statement":`,
+		"without principal": allow("sqs:*", queueARN),
+		"too large": `{"Statement":{"Effect":"Allow","Principal":"*","Action":"sqs:*",` +
+			`"Resource":"arn:aws:sqs:::` + strings.Repeat("q", 8192) + `"}}`,
+	} {
+		if _, err := a.ResourcePolicy(doc); !errors.Is(err, errResourcePolicy) {
+			t.Errorf("%s: error = %v, want errResourcePolicy", name, err)
+		}
+	}
+}
+
+func TestRootAndTypeOutOfStepAreAFault(t *testing.T) {
+	a := newAuthorizer()
+	check := Check{Action: "sqs:SendMessage", Resource: queueARN}
+	accountNotRoot := principal("arn:aws:iam::444455556666:root", allow("*", "*"))
+	accountNotRoot.Root = false
+	rootUser := principal(userARN, allow("*", "*"))
+	rootUser.Root = true
+	rootUser.AccountID = "444455556666"
+	for name, p := range map[string]sigv4.Principal{
+		"Type Account without Root": accountNotRoot,
+		"Root on a user":            rootUser,
+	} {
+		err := authorize(t, a, p, check)
+		var d *Denied
+		if !errors.Is(err, errPrincipal) || errors.As(err, &d) {
+			t.Errorf("%s: error = %v, want errPrincipal", name, err)
+		}
+	}
 }
