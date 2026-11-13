@@ -168,6 +168,25 @@ user or role the policy it needs, such as `sqs:*` on `*`.
   `aws:PrincipalTag/<key>` is supplied, so a condition on any of them now
   matches as in AWS.
 
+**Changes in v0.4.0.**
+
+- `aws:PrincipalOrgID` and `aws:PrincipalOrgPaths` are supplied, so a
+  condition on them now holds as in AWS: a principal whose account is in
+  the organization matches, and one outside it does not. A negated
+  condition (`StringNotEquals` and the like), which held for every
+  principal before, now holds only for principals outside the
+  organization; a `Deny` written that way, such as "deny anyone outside my
+  organization", no longer denies members.
+- When identity could not ask the accounts service about a principal's
+  account (identity reports its organization as unknown), both keys are
+  passed to tule.dev/policy as unknown, never as absent: a condition on
+  them never holds in an `Allow` and always holds in a `Deny`, whatever its
+  operator, so the request is decided as the worst case for the caller
+  (tule.dev/policy's "Unknown context keys").
+- identity v0.5.0 or later is needed: queues asks identity's signing-key
+  endpoint for version 4, which carries the organization keys. An older
+  identity fails every evaluated request with `500` `InternalFailure`.
+
 Each operation is evaluated as the action and resource the SQS Service
 Authorization Reference gives it (the table is `operationAccess` in
 `internal/modules/queues/access.go`, checked by a test against the
@@ -195,7 +214,12 @@ here), the principal's keys from the attributes identity hands over
 ARN with the role's path, `aws:userid`, `aws:PrincipalType`, and
 `aws:username` for an IAM user; a request cannot set them),
 `aws:PrincipalTag/<key>` for each of the IAM user's tags or the session's
-role's tags (identity issues no session tags), and, from the
+role's tags (identity issues no session tags), `aws:PrincipalOrgID` and
+`aws:PrincipalOrgPaths` for a principal whose account is in the
+organization the accounts service reports, or is its management account
+(left out otherwise, as AWS leaves them out; identity keeps them for up to
+30 seconds, so an account moved or removed keeps its old keys that long),
+and, from the
 reference's keys for SQS: `aws:ResourceTag/<key>` from the queue's tags,
 `aws:RequestTag/<key>` and `aws:TagKeys` for `CreateQueue` and `TagQueue`,
 and `aws:TagKeys` for `UntagQueue`. They fill policy variables such as
@@ -252,12 +276,6 @@ Gaps:
   principal deleted and created again under the same name does not inherit
   the grant. Here it does, until identity can resolve unique IDs for the
   services. A session whose role was deleted is refused everything.
-- **`aws:PrincipalOrgID` and `aws:PrincipalOrgPaths` are not supplied**:
-  identity does not carry the organization. A positive condition on them
-  never holds, and a negated one (`StringNotEquals` and the like) always
-  does, so a `Deny` written with a negated operator on them, such as the
-  common "deny anyone outside my organization", denies every evaluated
-  principal.
 - **Service principals never match.** No Tule caller is a service, so a
   statement naming `sqs.amazonaws.com` or `sns.amazonaws.com` grants
   nothing.
@@ -724,7 +742,7 @@ test, and, for role sessions, a real accounts service that identity's
 `AssumeRole` asks about member accounts. The checkouts are the siblings
 `../identity` and `../accounts` by default, or the directories
 `TULE_E2E_IDENTITY_DIR` and `TULE_E2E_ACCOUNTS_DIR` name; CI checks out
-`tulehq/identity` v0.4.0 and `tulehq/accounts` v0.2.0 and sets them.
+`tulehq/identity` v0.5.0 and `tulehq/accounts` v0.4.0 and sets them.
 Without a checkout those tests fail rather than being skipped.
 
 ## License
