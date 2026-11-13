@@ -215,6 +215,16 @@ func (s *orgStack) testOwnerOnly(t *testing.T) {
 	})), sessionARN, "sqs:AddPermission", queueARN("owner-only"), noResourceAllow)
 	// A shared action is granted.
 	send(t, c, u, "shared")
+
+	// The queue policy is still evaluated on them, so its Deny is reported
+	// as one.
+	v := createQueue(t, root, "owner-only-denied", nil)
+	requireNoErr(t, setPolicy(t, root, v, grant("Deny", `"*"`, `"sqs:SetQueueAttributes"`,
+		"owner-only-denied", "")), "deny SetQueueAttributes")
+	requireResourceDenied(t, errOf(c.SetQueueAttributes(t.Context(),
+		&sqs.SetQueueAttributesInput{
+			QueueUrl: aws.String(v), Attributes: map[string]string{"DelaySeconds": "5"},
+		})), sessionARN, "sqs:SetQueueAttributes", queueARN("owner-only-denied"), resourceDeny)
 }
 
 func (s *orgStack) testResourceDeny(t *testing.T) {

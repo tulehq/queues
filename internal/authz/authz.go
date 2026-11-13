@@ -84,6 +84,11 @@ type Check struct {
 	Policy   *policy.Policy
 	Action   string
 	Resource string
+	// Unshared marks an action a resource-based policy grants only to
+	// principals of the resource's account. A principal of another account
+	// is evaluated with Policy as usual, so a Deny in it applies, but an
+	// Allow is denied for want of a resource-based policy allowing it.
+	Unshared bool
 }
 
 // Denied is a check the principal may not make, and why, as
@@ -115,9 +120,14 @@ func Message(principal, action, resource string, reason policy.Reason) string {
 // IsRoot reports whether p is the root user of the authorizer's account,
 // which is never evaluated. Root alone is not enough: a Root principal of
 // another account is root of that account only, and is evaluated like any
-// principal of another account.
-func (a *Authorizer) IsRoot(p sigv4.Principal) bool {
-	return p.Root && p.AccountID == a.account
+// principal of another account. A principal identity hands over in a state
+// it never produces (checkPrincipal) is an error, root or not, so Root on
+// a principal of another type never skips evaluation.
+func (a *Authorizer) IsRoot(p sigv4.Principal) (bool, error) {
+	if err := checkPrincipal(p); err != nil {
+		return false, err
+	}
+	return p.Root && p.AccountID == a.account, nil
 }
 
 // Caller is the tule.dev/policy descriptor of p, from the attributes
@@ -141,42 +151,52 @@ func Caller(p sigv4.Principal) policy.Caller {
 // policies and the check's resource-based policy, the resource being the
 // account's: within the account either kind of Allow allows (a grant that
 // names only the account also needs an identity Allow), across accounts
-// both are needed, and an explicit Deny in either denies.
+// both are needed, and an explicit Deny in either denies. An Unshared
+// check of a principal of another account is never allowed.
 func (a *Authorizer) Authorize(r *http.Request, p sigv4.Principal, checks ...Check) error {
-	if a.IsRoot(p) {
-		return nil
+	root, err := a.IsRoot(p)
+	if err != nil || root {
+		return err
 	}
 	pols, err := a.policies(p)
 	if err != nil {
 		return err
 	}
-	if err = checkPrincipal(p); err != nil {
-		return err
-	}
-	caller := Caller(p)
 	base := a.Context(r, p)
 	for _, c := range checks {
-		ctx := base
-		if len(c.Context) > 0 {
-			ctx = maps.Clone(base)
-			maps.Copy(ctx, c.Context)
-		}
-		az := policy.Authorize(policy.AuthorizeRequest{
-			Action: c.Action, Resource: c.Resource, ResourceAccount: a.account,
-			Caller: caller, Context: ctx,
-		}, c.Policy, pols...)
-		if az.Decision == policy.Allow {
-			continue
-		}
-		if az.Reason == policy.NoReason {
-			return fmt.Errorf("authz: %s on %s denied (%v) without a reason",
-				c.Action, c.Resource, az.Decision)
-		}
-		return &Denied{
-			Principal: p.ARN, Action: c.Action, Resource: c.Resource, Reason: az.Reason,
+		if err = a.check(p, base, c, pols); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// check decides one check of p, with the base context and p's parsed
+// identity policies.
+func (a *Authorizer) check(
+	p sigv4.Principal, base map[string][]string, c Check, pols []*policy.Policy,
+) error {
+	ctx := base
+	if len(c.Context) > 0 {
+		ctx = maps.Clone(base)
+		maps.Copy(ctx, c.Context)
+	}
+	az := policy.Authorize(policy.AuthorizeRequest{
+		Action: c.Action, Resource: c.Resource, ResourceAccount: a.account,
+		Caller: Caller(p), Context: ctx,
+	}, c.Policy, pols...)
+	if az.Decision == policy.Allow && c.Unshared && p.AccountID != a.account {
+		// Only an Allow is replaced: an explicit Deny keeps its message.
+		az.Decision, az.Reason = policy.ImplicitDeny, policy.NoResourceAllow
+	}
+	switch {
+	case az.Decision == policy.Allow:
+		return nil
+	case az.Reason == policy.NoReason:
+		return fmt.Errorf("authz: %s on %s denied (%v) without a reason",
+			c.Action, c.Resource, az.Decision)
+	}
+	return &Denied{Principal: p.ARN, Action: c.Action, Resource: c.Resource, Reason: az.Reason}
 }
 
 // errPolicy wraps a policy identity handed over that this service cannot
