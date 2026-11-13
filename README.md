@@ -192,14 +192,14 @@ user or role the policy it needs, such as `sqs:*` on `*`.
 - **Policies stored by earlier releases are not bound.** A `Policy` stored
   by v0.3.0 or earlier names its principals by ARN, and keeps matching them
   by ARN, so a user or role created again under one of them is granted,
-  until the policy is written again: by `SetQueueAttributes` or
-  `CreateQueue`, or by `AddPermission` or `RemovePermission`, which bind the
-  whole policy they write. Nothing is bound on its own at upgrade. Such a
-  policy naming a user or role that no longer exists cannot be bound, so
-  `AddPermission` and `RemovePermission` on it fail with
-  `InvalidAttributeValue` for the `Policy` until the root key sets it again
-  without that principal. To bind every policy, read each queue's `Policy`
-  and set it again.
+  until the `Policy` is set again with `SetQueueAttributes` (or
+  `CreateQueue`), which binds the whole document. `AddPermission` binds
+  only the statement it adds and `RemovePermission` binds nothing, so
+  neither binds the statements already stored, and neither is refused
+  for them. Nothing is bound on its own at upgrade. To bind every policy,
+  read each queue's `Policy` and set it again; one naming a user or role
+  that no longer exists is then refused with `InvalidAttributeValue`, and
+  must be set without that principal.
 - identity v0.5.0 or later is needed: queues asks identity's signing-key
   endpoint for version 4, which carries the organization keys, and its
   principal-ID endpoint, which v0.5.0 added. An older identity fails every
@@ -327,23 +327,26 @@ User Guide, "AWS JSON policy elements: Principal"). With an identity
 endpoint, queues does the same through identity's principal-ID endpoint
 (`tule.dev/identity/principals`):
 
-- Every write of a `Policy`, `CreateQueue` and `SetQueueAttributes` with
-  one, and `AddPermission` and `RemovePermission`, binds the whole policy it
-  stores: each IAM user and role ARN in the `AWS` values of a `Principal` or
+- `CreateQueue` and `SetQueueAttributes` with a `Policy` bind the whole
+  document they store: each IAM user and role ARN in the `AWS` values of a `Principal` or
   `NotPrincipal` becomes the unique ID (`AIDA...`, `AROA...`) of the IAM user or
   role that has it now. Account IDs, root ARNs (all `AddPermission`
   generates), session ARNs, `*`, unique IDs and ARNs in conditions, such as
   `aws:PrincipalArn`, are kept. Where an ID replaces an ARN, the white
   space of the object it is in is not kept.
+- `AddPermission` binds the statement it generates, alone, and appends it
+  to the statements stored, which it keeps as they are. Its principals are
+  root ARNs, which are kept, so the binding has nothing to resolve and
+  makes no call to identity. `RemovePermission` binds nothing: removing a statement adds no
+  principal, so a revocation is never refused for a stale principal in
+  another statement, and never waits on identity.
 - An ARN no user or role has is refused as SQS refuses it: "Amazon SQS
   validates the resource policy and checks for the IAM entity. If the IAM
   entity doesn't exist, you will receive an error" ("Troubleshoot Amazon
   SQS API errors", SQS Developer Guide, under `InvalidAttributeValue`). The
   error is `InvalidAttributeValue`, "Invalid value for the parameter Policy.
   Reason: Invalid principal in policy: <ARN>"; SQS's wording is not
-  documented. `AddPermission` and `RemovePermission` answer the same for a
-  policy stored by an earlier release that names one; SQS lists no such
-  error for them, since a policy it stored is always bound.
+  documented.
 - Every read, `GetQueueAttributes` asking for `Policy` (or `All`) and the
   [inspection API](#inspection-api), shows each unique ID that a user or
   role still has as its current ARN, and leaves one that no user or role
@@ -357,11 +360,6 @@ endpoint, queues does the same through identity's principal-ID endpoint
   and the read, with `500` `InternalFailure`, logged. A policy that names
   no user or role, or ID of one, needs no call, and nor does a request
   that neither writes nor reads a `Policy`.
-- `AddPermission` and `RemovePermission` read and edit the policy, ask
-  identity outside the store's transaction, and write the result only if
-  the queue's `Policy` is still the one they read, starting again
-  otherwise, so a policy written meanwhile is never lost. One overtaken 8
-  times in a row fails with `500` `InternalFailure`.
 - `CreateQueue` for a queue that exists compares the bound `Policy`, so
   the same request after a principal it names was created again under its
   ARN, or against a policy an earlier release stored unbound, is

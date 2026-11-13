@@ -59,7 +59,8 @@ func (m *Module) bindAttributes(ctx context.Context, attrs map[string]string) er
 	return nil
 }
 
-// binder is bindPolicy over m's principals, for the store's policy edits.
+// binder is bindPolicy over m's principals, for the statement AddPermission
+// generates.
 func (m *Module) binder() contracts.BindFunc {
 	return func(ctx context.Context, doc string) (string, error) {
 		return bindPolicy(ctx, m.principals, doc)

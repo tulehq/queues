@@ -25,9 +25,12 @@ func permission(label string) contracts.Permission {
 	}
 }
 
-func TestAPermissionChangeStoresWhatBindReturns(t *testing.T) {
+func TestAddPermissionBindsOnlyItsStatement(t *testing.T) {
 	s, _ := newStore(t)
-	createQueue(t, s, "orders", false, nil)
+	stored := `{"Version":"2012-10-17","Statement":[{"Sid":"Dev","Effect":"Allow",` +
+		`"Principal":{"AWS":"arn:aws:iam::000000000000:user/dev"},` +
+		`"Action":"sqs:SendMessage","Resource":"arn:aws:sqs:us-east-1:000000000000:orders"}]}`
+	createQueue(t, s, "orders", false, map[string]string{contracts.AttrPolicy: stored})
 	var asked []string
 	bind := func(_ context.Context, doc string) (string, error) {
 		asked = append(asked, doc)
@@ -38,36 +41,37 @@ func TestAPermissionChangeStoresWhatBindReturns(t *testing.T) {
 	if err := s.AddPermission(t.Context(), "orders", permission("a"), bind); err != nil {
 		t.Fatalf("AddPermission: %v", err)
 	}
-	if got := ordersPolicy(t, s); strings.Contains(got, ":root") ||
-		len(asked) != 1 || !strings.Contains(asked[0], ":root") {
-		t.Fatalf("stored %s after binding %q", got, asked)
+	if len(asked) != 1 || strings.Contains(asked[0], "user/dev") ||
+		!strings.Contains(asked[0], `"Sid":"a"`) {
+		t.Fatalf("bind asked %q, want the generated statement alone", asked)
 	}
-	if err := s.AddPermission(t.Context(), "orders", permission("b"), bind); err != nil {
-		t.Fatalf("AddPermission: %v", err)
-	}
-	if err := s.RemovePermission(t.Context(), "orders", "a", bind); err != nil {
-		t.Fatalf("RemovePermission: %v", err)
-	}
-	if len(asked) != 3 {
-		t.Fatalf("bind asked %d times, want 3", len(asked))
+	got := ordersPolicy(t, s)
+	if strings.Contains(got, ":root") || !strings.Contains(got, `"111122223333"`) ||
+		!strings.Contains(got, `"arn:aws:iam::000000000000:user/dev"`) {
+		t.Fatalf("stored %s", got)
 	}
 }
 
-func TestRemovingTheLastStatementBindsNothing(t *testing.T) {
+func TestRemovePermissionStoresTheRestAsItWas(t *testing.T) {
 	s, _ := newStore(t)
 	createQueue(t, s, "orders", false, nil)
-	if err := s.AddPermission(t.Context(), "orders", permission("a"), nil); err != nil {
-		t.Fatalf("AddPermission: %v", err)
+	for _, label := range []string{"a", "b"} {
+		if err := s.AddPermission(t.Context(), "orders", permission(label), nil); err != nil {
+			t.Fatalf("AddPermission %s: %v", label, err)
+		}
 	}
-	err := s.RemovePermission(t.Context(), "orders", "a",
-		func(context.Context, string) (string, error) {
-			t.Error("bind asked to bind no policy")
-			return "", nil
-		})
-	if err != nil {
+	if err := s.RemovePermission(t.Context(), "orders", "a"); err != nil {
 		t.Fatalf("RemovePermission: %v", err)
 	}
-	if got := ordersPolicy(t, s); got != "" {
+	got := ordersPolicy(t, s)
+	if strings.Contains(got, `"Sid":"a"`) || !strings.Contains(got, `"Sid":"b"`) {
+		t.Fatalf("Policy after removing a: %s", got)
+	}
+	// Removing the last statement removes the Policy.
+	if err := s.RemovePermission(t.Context(), "orders", "b"); err != nil {
+		t.Fatalf("RemovePermission: %v", err)
+	}
+	if got = ordersPolicy(t, s); got != "" {
 		t.Fatalf("Policy %q after the last removal", got)
 	}
 }
@@ -83,49 +87,5 @@ func TestARefusedBindStoresNothing(t *testing.T) {
 	}
 	if got := ordersPolicy(t, s); got != "" {
 		t.Fatalf("Policy %q after a refused bind", got)
-	}
-}
-
-func TestAPolicyWrittenDuringABindIsNotLost(t *testing.T) {
-	s, _ := newStore(t)
-	createQueue(t, s, "orders", false, nil)
-	// The first bind lets another AddPermission in before the edit is
-	// written: the edit starts again on the policy holding it.
-	calls := 0
-	bind := func(ctx context.Context, doc string) (string, error) {
-		calls++
-		if calls == 1 {
-			if err := s.AddPermission(ctx, "orders", permission("other"), nil); err != nil {
-				t.Errorf("concurrent AddPermission: %v", err)
-			}
-		}
-		return doc, nil
-	}
-	if err := s.AddPermission(t.Context(), "orders", permission("mine"), bind); err != nil {
-		t.Fatalf("AddPermission: %v", err)
-	}
-	got := ordersPolicy(t, s)
-	if calls != 2 || !strings.Contains(got, `"Sid":"other"`) ||
-		!strings.Contains(got, `"Sid":"mine"`) {
-		t.Fatalf("after %d binds the Policy is %s", calls, got)
-	}
-}
-
-func TestAnEditOvertakenEveryTimeGivesUp(t *testing.T) {
-	s, _ := newStore(t)
-	createQueue(t, s, "orders", false, nil)
-	n := 0
-	err := s.AddPermission(t.Context(), "orders", permission("never"),
-		func(ctx context.Context, doc string) (string, error) {
-			n++
-			if aErr := s.AddPermission(ctx, "orders", permission("o"+strings.Repeat("x", n)),
-				nil); aErr != nil {
-				t.Errorf("concurrent AddPermission: %v", aErr)
-			}
-			return doc, nil
-		})
-	if !errors.Is(err, errPolicyContended) || n != maxPolicyEdits ||
-		strings.Contains(ordersPolicy(t, s), `"Sid":"never"`) {
-		t.Fatalf("error = %v after %d attempts", err, n)
 	}
 }
