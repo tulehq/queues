@@ -7,6 +7,7 @@ package queues
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gasmod/gas"
 
+	"tule.dev/queues/internal/authz"
 	"tule.dev/queues/internal/contracts"
 	"tule.dev/queues/internal/sqsapi"
 )
@@ -30,10 +32,11 @@ const (
 
 // Module registers the API routes and serves the operations behind them.
 type Module struct {
-	router   *gas.Router
-	store    contracts.QueueProvider
-	settings *contracts.QueueSettings
-	handlers map[string]handler
+	router     *gas.Router
+	authorizer *authz.Authorizer
+	store      contracts.QueueProvider
+	settings   *contracts.QueueSettings
+	handlers   map[string]handler
 }
 
 // handler serves one operation and returns its result, nil for an operation
@@ -44,6 +47,11 @@ type handler func(*call) (any, error)
 // call is one request to an operation.
 type call struct {
 	gas.Context
+	// pinned is the request's context with the queue authorization
+	// evaluated pinned, or nil when it pinned none.
+	pinned context.Context //nolint:containedctx // the call is the request's context
+	// req is the request's parameters, decoded once (decoded).
+	req    any
 	params sqsapi.Params
 	// pathQueue is the queue the URL path names, for a Query request sent
 	// to a queue URL.
@@ -53,13 +61,24 @@ type call struct {
 	proto     sqsapi.Protocol
 }
 
+// Value looks key up in the pinned context when authorization pinned a
+// queue, so the store, which takes the call as its context, acts on the
+// evaluated queue only.
+func (c *call) Value(key any) any {
+	if c.pinned != nil {
+		return c.pinned.Value(key)
+	}
+	return c.Context.Value(key)
+}
+
 // NewModule returns the constructor gas uses to build a Module serving the
-// queues of settings' account from store.
-func NewModule(settings *contracts.QueueSettings) func(
+// queues of settings' account from store, authorizing each request with
+// authorizer.
+func NewModule(settings *contracts.QueueSettings, authorizer *authz.Authorizer) func(
 	router *gas.Router, store contracts.QueueProvider,
 ) *Module {
 	return func(router *gas.Router, store contracts.QueueProvider) *Module {
-		m := &Module{router: router, store: store, settings: settings}
+		m := &Module{router: router, store: store, settings: settings, authorizer: authorizer}
 		m.handlers = map[string]handler{
 			"CreateQueue":                  m.createQueue,
 			"DeleteQueue":                  m.deleteQueue,
@@ -129,6 +148,9 @@ func (m *Module) dispatch(ctx gas.Context) error {
 	if !ok {
 		return m.fail(c, sqsapi.ErrInvalidAction(c.op))
 	}
+	if err := m.authorize(c); err != nil {
+		return m.fail(c, err)
+	}
 	result, err := h(c)
 	if err != nil {
 		return m.fail(c, err)
@@ -155,6 +177,9 @@ func (c *call) readQuery() error {
 	r := c.Request()
 	if err := r.ParseForm(); err != nil {
 		return sqsapi.ErrMalformedQueryString()
+	}
+	if err := sqsapi.CheckForm(r.Form); err != nil {
+		return err //nolint:wrapcheck // an *sqsapi.Error
 	}
 	c.params = sqsapi.Params(r.Form)
 	c.op = r.Form.Get("Action")
@@ -183,6 +208,12 @@ func (c *call) decode(v any) error {
 		return nil
 	}
 	if err := json.Unmarshal(c.body, v); err != nil {
+		// A field's own decoder, such as RequestTags', may answer with an
+		// SQS error of its own.
+		var apiErr *sqsapi.Error
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
 		return sqsapi.ErrSerialization()
 	}
 	return nil
@@ -267,4 +298,28 @@ func entryError(c *call, id string, err error) sqsapi.BatchResultErrorEntry {
 	return sqsapi.BatchResultErrorEntry{
 		ID: id, Code: apiErr.Code, Message: apiErr.Message, SenderFault: apiErr.Sender(),
 	}
+}
+
+// errDecodedAs is a request decoded as one type and then asked for as
+// another: authorization and the operation disagreeing on the request's
+// shape, a fault of this service.
+var errDecodedAs = errors.New("the request was decoded as another type")
+
+// decoded returns the request's parameters as T, decoding them on the first
+// call and returning that same value on every later one. Authorization and
+// the operation both read the request through it, so they act on one
+// decoding and can never see different values.
+func decoded[T any](c *call) (*T, error) {
+	if r, ok := c.req.(*T); ok {
+		return r, nil
+	}
+	if c.req != nil {
+		return nil, fmt.Errorf("%w: %T, asked for as %T", errDecodedAs, c.req, new(T))
+	}
+	r := new(T)
+	if err := c.decode(r); err != nil {
+		return nil, err
+	}
+	c.req = r
+	return r, nil
 }

@@ -62,14 +62,27 @@ func TestIdentityRoleSession(t *testing.T) {
 	})
 	session := assumeOrganizationRole(t, identityURL, member)
 
-	t.Run("the session's credentials call queues", func(t *testing.T) {
+	t.Run("the member account's session is refused across accounts", func(t *testing.T) {
+		// The session verifies, and its role's AdministratorAccess allows
+		// everything, but it is the member account's and the queues are the
+		// management account's: AWS needs a resource-based policy to grant
+		// a cross-account request, and queue policies are not enforced.
 		requireMatch(t, regexp.MustCompile(`^ASIA`), session.AccessKeyID, "session key ID")
+		sessionARN := "arn:aws:sts::" + member + ":assumed-role/" + organizationRole + "/e2e"
 		c := sqsClientWith(srv, session)
-		u := createQueue(t, c, "from-session", nil)
-		send(t, c, u, "hello")
-		requireEqual(t, aws.ToString(receiveOne(t, c, u).Body), "hello", "body")
-		requireOK(t, inspectorWith(srv, session).do(t, http.MethodGet, "/_queues/queues", nil),
-			"inspection with the session")
+		err := errOf(c.CreateQueue(t.Context(),
+			&sqs.CreateQueueInput{QueueName: aws.String("from-session")}))
+		requireCrossAccountDenied(t, err, sessionARN, "sqs:CreateQueue", queueARN("from-session"))
+		requireQueueMissing(t, sqsClientWith(srv, aws.Credentials{
+			AccessKeyID: identityRootKeyID, SecretAccessKey: identityRootSecret,
+		}), "from-session")
+		requireAPIErrorBody(
+			t,
+			inspectorWith(srv, session).do(t, http.MethodGet, "/_queues/queues", nil),
+			http.StatusForbidden,
+			"AccessDenied",
+			"inspection with the member session",
+		)
 	})
 
 	t.Run("a tampered token is refused", func(t *testing.T) {

@@ -408,3 +408,106 @@ func TestReceivedPicksTheAttributesAskedFor(t *testing.T) {
 		t.Fatalf("a receive asking for nothing got %+v", none)
 	}
 }
+
+func requireCodeOf(t *testing.T, err error, code, what string) {
+	t.Helper()
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code != code {
+		t.Fatalf("%s: error = %v, want %s", what, err, code)
+	}
+}
+
+func TestARepeatedTagKeyIsRefused(t *testing.T) {
+	var ok TagQueueRequest
+	if err := json.Unmarshal([]byte(`{"Tags":{"team":"blue","env":"dev"}}`), &ok); err != nil ||
+		len(ok.Tags) != 2 || ok.Tags["team"] != "blue" {
+		t.Fatalf("tags = %v, %v", ok.Tags, err)
+	}
+	var none CreateQueueRequest
+	if err := json.Unmarshal([]byte(`{"tags":null}`), &none); err != nil || none.Tags != nil {
+		t.Fatalf("null tags = %v, %v", none.Tags, err)
+	}
+
+	var dup CreateQueueRequest
+	requireCodeOf(t, json.Unmarshal([]byte(`{"tags":{"team":"blue","team":"red"}}`), &dup),
+		CodeInvalidParameterValue, "a repeated JSON key")
+	// A key spelled with an escape is the same key.
+	requireCodeOf(t, json.Unmarshal([]byte(`{"tags":{"team":"blue","team":"red"}}`), &dup),
+		CodeInvalidParameterValue, "a repeated, escaped JSON key")
+	requireCodeOf(t, json.Unmarshal([]byte(`{"tags":{"team":1}}`), &dup),
+		CodeSerialization, "a value that is not a string")
+	requireCodeOf(t, json.Unmarshal([]byte(`{"tags":["team"]}`), &dup),
+		CodeSerialization, "tags that are not an object")
+
+	var query TagQueueRequest
+	requireCodeOf(t, Params(url.Values{
+		"Tag.1.Key": {"team"}, "Tag.1.Value": {"blue"},
+		"Tag.2.Key": {"team"}, "Tag.2.Value": {"red"},
+	}).Decode(&query), CodeInvalidParameterValue, "a repeated Query key")
+}
+
+func TestCheckFormRefusesFormsReadTwoWays(t *testing.T) {
+	accepted := []string{
+		"Action=TagQueue&Tag.1.Key=env&Tag.1.Value=dev&Tag.2.Key=team&Tag.2.Value=blue",
+		"Action=TagQueue&Tag.Key=env&Tag.Value=dev",
+		"Action=GetQueueAttributes&AttributeName=All",
+		"Action=ReceiveMessage&AttributeName.1=All&AttributeName.1=All",
+		"Action=TagQueue&Tag.1.Key=env&Tag.1.Key=team&Tag.1.Value=dev",
+		"Action=GetQueueAttributes&AttributeName.1=All&AttributeName.10=Policy",
+		"Action=SendMessage&MessageAttribute.1.Name=a&MessageAttribute.1.Value.DataType=String" +
+			"&MessageAttribute.1.Value.StringListValue.1=x&MessageAttribute.1.Value.StringListValue.2=y",
+	}
+	for _, f := range accepted {
+		form, err := url.ParseQuery(f)
+		if err != nil {
+			t.Fatalf("parse %s: %v", f, err)
+		}
+		if err = CheckForm(form); err != nil {
+			t.Errorf("%s: %v", f, err)
+		}
+	}
+	refused := []string{
+		"Tag.1.Key=env&Tag.1.Value=dev&Tag.01.Value=prod",
+		"Tag.1.Key=env&Tag.+1.Value=prod",
+		"Tag.0.Key=env&Tag.0.Value=dev",
+		"Tag.-1.Key=env&Tag.-1.Value=dev",
+		"Tag.1.Key=env&Tag.1.Value=dev&Tag.Key=env&Tag.Value=prod",
+		"AttributeName=All&AttributeName.1=Policy",
+		"TagKey.1=a&TagKey.01=b",
+		"SendMessageBatchRequestEntry.1.Id=a&SendMessageBatchRequestEntry.01.Id=b",
+	}
+	for _, f := range refused {
+		form, err := url.ParseQuery(f)
+		if err != nil {
+			t.Fatalf("parse %s: %v", f, err)
+		}
+		requireCodeOf(t, CheckForm(form), CodeMalformedQueryString, f)
+	}
+}
+
+func TestAStoreTagCaseCollisionIsInvalidParameterValue(t *testing.T) {
+	e := ToError(t.Context(), &contracts.TagKeyCaseError{Key: "env"})
+	if e.Code != CodeInvalidParameterValue || e.Status != http.StatusBadRequest ||
+		!strings.Contains(e.Message, "differs only by case") {
+		t.Fatalf("error = %+v", e)
+	}
+}
+
+func TestARepeatedQueryParameterReadsItsFirstValue(t *testing.T) {
+	form, err := url.ParseQuery("Tag.1.Key=env&Tag.1.Key=team&Tag.1.Value=dev&Tag.1.Value=prod")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err = CheckForm(form); err != nil {
+		t.Fatalf("CheckForm: %v", err)
+	}
+	for range 20 {
+		var req TagQueueRequest
+		if err = Params(
+			form,
+		).Decode(&req); err != nil || len(req.Tags) != 1 ||
+			req.Tags["env"] != "dev" {
+			t.Fatalf("tags = %v, %v, want env=dev", req.Tags, err)
+		}
+	}
+}

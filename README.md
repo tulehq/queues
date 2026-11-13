@@ -6,10 +6,12 @@ end-to-end tests: point an AWS SDK at it and the usual queue and message
 calls work, standard and FIFO, over both protocols SQS serves, AWS JSON 1.0
 and Query.
 
-It is not a production queue service. There are no permissions, and every
-access key it accepts shares the same queues: the configured key, the
-account's root user's, and, when it is pointed at
-[identity](https://github.com/tulehq/identity), every key identity issued.
+It is not a production queue service. Every access key it accepts shares
+the same queues: the configured key, the account's root user's, and, when it
+is pointed at [identity](https://github.com/tulehq/identity), every key
+identity issued. Standalone, the configured key may do everything; with
+identity, every other key may do what its identity policies allow
+([Permissions](#permissions)).
 
 ## Running it
 
@@ -58,7 +60,7 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_ShutdownTimeout` | `7s` | How long a graceful shutdown waits for in-flight requests |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
 | `TULE_Auth_SecretAccessKey` | required | Its secret |
-| `TULE_Auth_IdentityEndpoint` | unset | The identity service's base URL, such as `http://localhost:9030`: an absolute http or https URL. Set, the keys identity issued are accepted as well as the configured key, and identity is asked about them with the configured key, which must be identity's root key. Unset, queues runs standalone on the configured key alone |
+| `TULE_Auth_IdentityEndpoint` | unset | The identity service's base URL, such as `http://localhost:9030`: an absolute http or https URL. Set, the keys identity issued are accepted as well as the configured key, and evaluated against their identity policies, and identity is asked about them with the configured key, which must be identity's root key. Unset, queues runs standalone on the configured key alone |
 | `TULE_GasEnv` | | `development` logs console output at trace level, `production` logs at warn level, `testing` disables logging |
 
 The server refuses to start without an access key, because every request is
@@ -78,6 +80,126 @@ and the configured key keeps working.
 When the server begins to shut down, the long polls in flight return at
 once with no messages, so a shutdown does not wait out their 20 seconds.
 Logs go to the console only; there is no log shipping.
+
+## Permissions
+
+Standalone, without `TULE_Auth_IdentityEndpoint`, nothing is evaluated: the
+configured key is the account's root user and may call every operation and
+the inspection API.
+
+With an identity endpoint, the configured key, which is identity's root key
+too, is still never evaluated, as AWS never evaluates the root user. Only the
+configured account's root user is root here: a principal marked root in
+another account is refused like any principal of another account. Every
+other key identity issues, an IAM user's or a role session's, is evaluated on
+every request against its identity policies as identity hands them over (a
+user's inline and attached managed policies, a session's role's), with
+[tule.dev/policy](https://github.com/tulehq/policy): an explicit `Deny` wins,
+otherwise the request needs an `Allow`. A request no policy allows fails with
+`403` `AccessDenied`, the code SQS sends in Query and in the JSON protocol's
+`x-amzn-query-error` header (the JSON `__type` is `AccessDenied` too), with
+IAM's message:
+
+```
+User: arn:aws:iam::000000000000:user/dev is not authorized to perform: sqs:sendmessage on resource: arn:aws:sqs:us-east-1:000000000000:orders because no identity-based policy allows the sqs:sendmessage action
+```
+
+or `... with an explicit deny in an identity-based policy`. The action is in
+lower case, as SQS writes it in its denials. A denied request does nothing;
+it is checked before the queue is looked up, so a queue that does not exist
+is denied too.
+
+**Breaking change in v0.2.0.** A key identity issued that has no policy
+allowing an operation could call it before and is denied now. Give each
+user or role the policy it needs, such as `sqs:*` on `*`.
+
+Each operation is evaluated as the action and resource the SQS Service
+Authorization Reference gives it (the table is `operationAccess` in
+`internal/modules/queues/access.go`, checked by a test against the
+reference's JSON in `internal/modules/queues/testdata`):
+
+| Operation | Action | Resource |
+|---|---|---|
+| `ListQueues` | `sqs:ListQueues` | `*` |
+| `CreateQueue` | `sqs:CreateQueue`, and `sqs:TagQueue` when it has tags | the queue it creates |
+| `SendMessage`, `SendMessageBatch` | `sqs:SendMessage` | the queue |
+| `DeleteMessage`, `DeleteMessageBatch` | `sqs:DeleteMessage` | the queue |
+| `ChangeMessageVisibility`, `ChangeMessageVisibilityBatch` | `sqs:ChangeMessageVisibility` | the queue |
+| Every other operation | `sqs:<Operation>` | the queue |
+
+A queue is `arn:aws:sqs:<region>:<account>:<name>`, in the configured
+account and region. A batch is allowed or denied whole, as its entries all
+name its one queue.
+
+The condition keys supplied are `aws:SourceIp` (the connection's address),
+`aws:CurrentTime`, `aws:EpochTime`, `aws:SecureTransport`,
+`aws:RequestedRegion` (the configured region, as an endpoint fixes it in
+AWS, not the region the request was signed for, since any region verifies
+here), `aws:PrincipalAccount`, `aws:PrincipalArn`,
+`aws:PrincipalType`, `aws:username` for an IAM user, and, from the
+reference's keys for SQS: `aws:ResourceTag/<key>` from the queue's tags,
+`aws:RequestTag/<key>` and `aws:TagKeys` for `CreateQueue` and `TagQueue`,
+and `aws:TagKeys` for `UntagQueue`. They fill policy variables such as
+`${aws:username}` too. A request from an evaluated key with more than 50 tags
+or tag keys, or an `UntagQueue` key longer than 128 characters, fails with
+`InvalidParameterValue` before it is evaluated, which bounds the work an
+evaluation does; the root key is not held to it. Every other string evaluated is bounded
+before evaluation too: a queue name past 80 characters is refused as the
+operation refuses it (`InvalidParameterValue`, or `QueueDoesNotExist` for a
+queue URL), so no ARN is longer than the 80-character name allows, and a
+tag key or value past 128 or 256 characters fails `InvalidParameterValue`.
+
+A request is decoded once, and the operation acts on the decoding that was
+evaluated. The queue an operation acts on is the queue it was evaluated on. Its tags are
+read, with its store ID, before the evaluation, and the operation runs pinned
+to that ID: a queue deleted and created again under the same name in
+between, or created where none existed, is answered `QueueDoesNotExist`
+rather than acted on. A tag changed in between is not noticed; the request
+is evaluated on the tags as they were read.
+
+Condition keys match without regard to case, so tag keys that differ only by
+case (`env`, `ENV`) would feed one `aws:RequestTag/env` or
+`aws:ResourceTag/env`. For an evaluated key, a `CreateQueue` or `TagQueue`
+with two such keys, or a `TagQueue` adding one beside a stored key of other
+case, fails with `InvalidParameterValue` (checked again in the transaction that
+writes the tags, so two such requests at once cannot both pass), and a queue that already holds two
+such keys (the root key may write them) is not evaluated: every evaluated
+request on it fails with `500` `InternalFailure`, logged, until the root key
+removes one.
+
+The [inspection API](#inspection-api) is not AWS's, and needs `tule:Inspect`,
+an action of Tule's own, on `arn:aws:sqs:<region>:<account>:*`: a policy
+grants it with that ARN, a wider pattern such as `arn:aws:sqs:*:*:*`, or
+`*`. The configured key needs nothing.
+
+Gaps:
+
+- **Queue policies are stored, not enforced.** `Policy`, and what
+  `AddPermission` writes into it, grant and refuse nothing. Only identity
+  policies are evaluated; there are no permissions boundaries, session
+  policies or SCPs.
+- **Cross-account access is refused.** The queues are the configured
+  account's. A principal of another account, such as a member account's
+  `OrganizationAccountAccessRole` session, is evaluated on its identity
+  policies first (an explicit deny or a missing allow is reported as such),
+  and when they allow the request it is still denied, "... because no
+  resource-based policy allows the \<action\> action": AWS grants a
+  cross-account request only when the queue's policy allows it too ("Troubleshoot an access denied
+  error in Amazon SQS", SQS Developer Guide), and queue policies are not
+  enforced yet. Allowing it on identity policies alone would let a member
+  account's administrator reach the management account's queues. The
+  inspection API is refused the same way.
+- **A role session's `aws:PrincipalArn` has no path.** It is its role's ARN
+  without the role's path (`arn:aws:iam::<account>:role/<name>`), which the
+  session ARN does not carry and identity does not hand over yet. A policy
+  condition on a role ARN that includes a path, such as `ArnLike` on
+  `arn:aws:iam::*:role/restricted/*`, does not match a session, so a
+  `Deny` written that way does not apply to sessions yet; AWS's value has
+  the path. `aws:PrincipalTag/<key>` is not supplied, nor `aws:userid` but
+  for the root user.
+- **Event source mappings poll with the credentials functions supplies.**
+  The configured key keeps working unchanged; a role's session needs the SQS permissions AWS documents for mappings
+  (`sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`).
 
 ## Health checks
 
@@ -255,7 +377,8 @@ Beside SQS's API, the service answers JSON routes under `/_queues/` that are
 not AWS's: to look at the queues and their messages without receiving them,
 and to reset the store between tests. They are signed like every other
 request, for the `sqs` service, with the configured key or any key identity
-accepts.
+accepts, and a key identity issued needs `tule:Inspect`
+([Permissions](#permissions)).
 
 | Route | Answer |
 |---|---|
@@ -314,9 +437,9 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
 
 ## Differences from AWS
 
-- **Every accepted key may call every operation, on the same queues.**
-  There are no permissions, so `AccessDenied` is never returned and nothing
-  here tells you whether a deployment's permissions are right. `Policy` is
+- **Only identity policies are enforced, on the same queues.** Every
+  accepted key sees the same queues; what it may do is decided by its
+  identity policies alone ([Permissions](#permissions)). `Policy` is
   kept and reported but enforces nothing. `AddPermission` writes a
   statement into `Policy` with the label as its `Sid`, as SQS generates
   one, and fails with `InvalidParameterValue` for a label in use;
@@ -324,7 +447,9 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
   policy does not have. Neither grants anything.
 - **One account and one region.** The configured ones. A queue URL of
   another account, and `GetQueueUrl` with another
-  `QueueOwnerAWSAccountId`, fail with `QueueDoesNotExist`. A queue URL's
+  `QueueOwnerAWSAccountId`, fail with `QueueDoesNotExist`, before the
+  request is evaluated; a request is always evaluated on the ARN of the
+  configured region and account and the queue's name. A queue URL's
   host is not checked, since requests go to whatever endpoint the client
   is configured with.
 - **No encryption.** `KmsMasterKeyId`, `KmsDataKeyReusePeriodSeconds` and
@@ -383,6 +508,17 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
   - `CreateQueue` compares only the attributes the request sets, and not
     the tags.
   - The number of tags is not limited; SQS recommends at most 50.
+  - A Query form that could be read two ways fails with
+    `MalformedQueryString`, before it is evaluated: a list index spelled
+    other than `1`, `2`, ... (`Tag.01`, `Tag.+1`, `Tag.0`), and a list
+    given both indexed and in the one-item shorthand (`Tag.1.Key` with
+    `Tag.Key`). A parameter given more than once is read as its first
+    value.
+  - A `CreateQueue` or `TagQueue` that gives one tag key two values, as
+    two JSON members (an escaped spelling counts as the same key) or two
+    `Tag.N.Key` entries, fails with `InvalidParameterValue`, for every
+    key, before the request is evaluated, rather than the later value
+    winning.
   - `PurgeQueue` keeps a FIFO queue's deduplication records, as deleting
     a message does, which the developer guide documents: a message sent
     again within 5 minutes with a purged message's deduplication ID is
@@ -465,7 +601,7 @@ test, and, for role sessions, a real accounts service that identity's
 `AssumeRole` asks about member accounts. The checkouts are the siblings
 `../identity` and `../accounts` by default, or the directories
 `TULE_E2E_IDENTITY_DIR` and `TULE_E2E_ACCOUNTS_DIR` name; CI checks out
-`tulehq/identity` v0.1.0 and `tulehq/accounts` v0.2.0 and sets them.
+`tulehq/identity` v0.2.0 and `tulehq/accounts` v0.2.0 and sets them.
 Without a checkout those tests fail rather than being skipped.
 
 ## License

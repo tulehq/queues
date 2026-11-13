@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"tule.dev/queues/internal/contracts"
@@ -43,7 +44,11 @@ func scanQueue(r scanner) (*queueRow, error) {
 	return &q, nil
 }
 
-// loadQueue returns the queue name, or contracts.ErrQueueNotFound.
+// loadQueue returns the queue name, or contracts.ErrQueueNotFound. Under a
+// context that pins name (contracts.WithQueuePin), a queue of that name with
+// another ID is not found either: it is not the queue the request was
+// evaluated on. Every operation resolves its queue here, in its own
+// transaction, so the check and the act are one.
 func loadQueue(ctx context.Context, tx *sql.Tx, name string) (*queueRow, error) {
 	rows, err := queryAll(ctx, tx, scanQueue,
 		`SELECT `+queueColumns+` FROM queues WHERE name = ?`, name)
@@ -51,6 +56,9 @@ func loadQueue(ctx context.Context, tx *sql.Tx, name string) (*queueRow, error) 
 		return nil, err
 	}
 	if len(rows) == 0 {
+		return nil, contracts.ErrQueueNotFound
+	}
+	if id, ok := contracts.PinnedQueue(ctx, name); ok && contracts.QueueID(rows[0].id) != id {
 		return nil, contracts.ErrQueueNotFound
 	}
 	return rows[0], nil
@@ -464,14 +472,54 @@ func putTags(ctx context.Context, tx *sql.Tx, queueID int64, tags map[string]str
 }
 
 // TagQueue adds tags to the queue, replacing the values of keys it has.
+//
+// Under a context that pins the queue (an evaluated request), it refuses,
+// with *contracts.TagKeyCaseError, tags that would leave the queue with two
+// keys differing only by case, checked in the transaction that writes them:
+// two such requests at once cannot both pass a check made before it. A root
+// request carries no pin and is unchanged.
 func (s *Service) TagQueue(ctx context.Context, name string, tags map[string]string) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		q, err := loadQueue(ctx, tx, name)
 		if err != nil {
 			return err
 		}
+		if _, pinned := contracts.PinnedQueue(ctx, name); pinned {
+			if err = checkTagCase(ctx, tx, q.id, tags); err != nil {
+				return err
+			}
+		}
 		return putTags(ctx, tx, q.id, tags)
 	})
+}
+
+// checkTagCase refuses tags with a key that differs only by case from
+// another of tags or from one the queue has.
+func checkTagCase(ctx context.Context, tx *sql.Tx, queueID int64, tags map[string]string) error {
+	stored, err := queryAll(ctx, tx, func(r scanner) (string, error) {
+		var k string
+		sErr := r.Scan(&k)
+		return k, sErr
+	}, `SELECT key FROM queue_tags WHERE queue_id = ?`, queueID)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]string, len(stored)+len(tags))
+	for _, k := range stored {
+		seen[strings.ToLower(k)] = k
+	}
+	added := make(map[string]string, len(tags))
+	for k := range tags {
+		lower := strings.ToLower(k)
+		if s, ok := seen[lower]; ok && s != k {
+			return &contracts.TagKeyCaseError{Key: k}
+		}
+		if a, ok := added[lower]; ok && a != k {
+			return &contracts.TagKeyCaseError{Key: k}
+		}
+		added[lower] = k
+	}
+	return nil
 }
 
 // UntagQueue removes the tags with the given keys. A key the queue does not
@@ -494,12 +542,24 @@ func (s *Service) UntagQueue(ctx context.Context, name string, keys []string) er
 
 // ListQueueTags returns the queue's tags.
 func (s *Service) ListQueueTags(ctx context.Context, name string) (map[string]string, error) {
-	var out map[string]string
+	_, tags, err := s.QueueTags(ctx, name)
+	return tags, err
+}
+
+// QueueTags returns the queue's ID and tags, read in one transaction.
+func (s *Service) QueueTags(
+	ctx context.Context, name string,
+) (contracts.QueueID, map[string]string, error) {
+	var (
+		out map[string]string
+		id  contracts.QueueID
+	)
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		q, err := loadQueue(ctx, tx, name)
 		if err != nil {
 			return err
 		}
+		id = contracts.QueueID(q.id)
 		type tag struct{ k, v string }
 		tags, err := queryAll(ctx, tx, func(r scanner) (tag, error) {
 			var t tag
@@ -515,7 +575,7 @@ func (s *Service) ListQueueTags(ctx context.Context, name string) (map[string]st
 		}
 		return nil
 	})
-	return out, err
+	return id, out, err
 }
 
 // ListDeadLetterSourceQueues lists, in order, the names of the queues whose
