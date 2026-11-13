@@ -326,6 +326,13 @@ func ToError(ctx context.Context, err error) *Error {
 	if errors.As(err, &receipt) {
 		return ErrReceiptHandleIsInvalid(receipt.Handle)
 	}
+	var pe *contracts.PolicyError
+	if errors.As(err, &pe) {
+		if pe.OverLimit {
+			return ErrOverLimit(pe.Reason)
+		}
+		return ErrInvalidAttributeValue(contracts.AttrPolicy, pe.Reason)
+	}
 	var invalid *contracts.InvalidError
 	if errors.As(err, &invalid) {
 		return errInvalidValue(invalid.Field, invalid.Value, invalid.Reason)

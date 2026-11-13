@@ -1,6 +1,7 @@
 package sqlimpl
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -637,13 +638,18 @@ func (s *Service) sourcesOf(ctx context.Context, tx *sql.Tx, name, after string,
 	return names, nil
 }
 
-// policy is a queue policy as AddPermission writes it.
-type policy struct {
-	Version   string            `json:"Version"`
-	ID        string            `json:"Id"`
+// policyDoc is a queue policy as AddPermission and RemovePermission read
+// and write it: the elements a policy has (a stored one was accepted by
+// contracts.CheckPolicy, which refuses any other), Version and Id kept as
+// they are, or left out when they are, and Statement, one object or an
+// array, written back as an array.
+type policyDoc struct {
+	Version   *string           `json:"Version,omitempty"`
+	ID        *string           `json:"Id,omitempty"`
 	Statement []json.RawMessage `json:"Statement"`
 }
 
+// statement is the statement AddPermission generates.
 type statement struct {
 	Principal map[string][]string `json:"Principal"`
 	Sid       string              `json:"Sid"`
@@ -663,23 +669,45 @@ func sidOf(raw json.RawMessage) string {
 	return st.Sid
 }
 
-// queuePolicy reads the queue's Policy, or an empty one when it has none.
-func (s *Service) queuePolicy(q *queueRow) (*policy, error) {
+// queuePolicy reads the queue's Policy, or a new one when it has none: the
+// 2012-10-17 version and the Id SQS gives a generated policy,
+// <queue ARN>/SQSDefaultPolicy.
+func (s *Service) queuePolicy(q *queueRow) (*policyDoc, error) {
 	v := q.attrs[contracts.AttrPolicy]
-	p := &policy{Version: "2012-10-17", ID: s.settings.ARN(q.name) + "/SQSDefaultPolicy"}
 	if v == "" {
-		return p, nil
+		version, id := "2012-10-17", s.settings.ARN(q.name)+"/SQSDefaultPolicy"
+		return &policyDoc{Version: &version, ID: &id}, nil
 	}
-	if err := json.Unmarshal([]byte(v), p); err != nil {
-		return nil, &contracts.InvalidError{
-			Field: contracts.AttrPolicy, Value: v,
-			Reason: "The queue's Policy is not a policy document with a list of statements",
-		}
+	var raw struct {
+		Version   *string         `json:"Version"`
+		ID        *string         `json:"Id"`
+		Statement json.RawMessage `json:"Statement"`
+	}
+	invalid := &contracts.InvalidError{
+		Field: contracts.AttrPolicy, Value: v,
+		Reason: "The queue's Policy is not a policy document with statements",
+	}
+	if err := json.Unmarshal([]byte(v), &raw); err != nil {
+		return nil, invalid
+	}
+	p := &policyDoc{Version: raw.Version, ID: raw.ID}
+	st := bytes.TrimSpace(raw.Statement)
+	switch {
+	case len(st) > 0 && st[0] == '{':
+		p.Statement = []json.RawMessage{st}
+	case json.Unmarshal(st, &p.Statement) != nil:
+		return nil, invalid
 	}
 	return p, nil
 }
 
-func (s *Service) savePolicy(ctx context.Context, tx *sql.Tx, q *queueRow, p *policy) error {
+// savePolicy stores p as the queue's Policy, or removes the Policy when p
+// has no statement left. The policy it writes is checked as SetQueueAttributes
+// checks one, so nothing that cannot be evaluated is stored; over a quota it
+// is *contracts.PolicyError with OverLimit, which AddPermission answers
+// with OverLimit ("AddPermission returns this error if the maximum number of
+// permissions for the queue is reached").
+func (s *Service) savePolicy(ctx context.Context, tx *sql.Tx, q *queueRow, p *policyDoc) error {
 	if len(p.Statement) == 0 {
 		delete(q.attrs, contracts.AttrPolicy)
 		return s.saveAttributes(ctx, tx, q)
@@ -688,13 +716,16 @@ func (s *Service) savePolicy(ctx context.Context, tx *sql.Tx, q *queueRow, p *po
 	if err != nil {
 		return fmt.Errorf("encode policy: %w", err)
 	}
+	if pe := contracts.CheckPolicy(string(raw)); pe != nil {
+		return pe
+	}
 	q.attrs[contracts.AttrPolicy] = string(raw)
 	return s.saveAttributes(ctx, tx, q)
 }
 
 // AddPermission adds a statement to the queue's Policy, as SQS's
 // AddPermission generates one: the label as its Sid, allowing the accounts'
-// root users the actions on the queue. The policy has no effect here.
+// root users the actions on the queue.
 func (s *Service) AddPermission(ctx context.Context, name string, perm contracts.Permission) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		q, err := loadQueue(ctx, tx, name)
