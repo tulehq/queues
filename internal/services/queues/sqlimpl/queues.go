@@ -701,33 +701,75 @@ func (s *Service) queuePolicy(q *queueRow) (*policyDoc, error) {
 	return p, nil
 }
 
-// savePolicy stores p as the queue's Policy, or removes the Policy when p
-// has no statement left. The policy it writes is checked as SetQueueAttributes
-// checks one, so nothing that cannot be evaluated is stored; over a quota it
-// is *contracts.PolicyError with OverLimit, which AddPermission answers
-// with OverLimit ("AddPermission returns this error if the maximum number of
-// permissions for the queue is reached").
-func (s *Service) savePolicy(ctx context.Context, tx *sql.Tx, q *queueRow, p *policyDoc) error {
+// encodePolicy returns p as the queue's Policy, or "" when p has no
+// statement left, which removes the Policy. The policy it writes is checked
+// as SetQueueAttributes checks one, so nothing that cannot be evaluated is
+// stored; over a quota it is *contracts.PolicyError with OverLimit, which
+// AddPermission answers with OverLimit ("AddPermission returns this error
+// if the maximum number of permissions for the queue is reached").
+func encodePolicy(p *policyDoc) (string, error) {
 	if len(p.Statement) == 0 {
-		delete(q.attrs, contracts.AttrPolicy)
-		return s.saveAttributes(ctx, tx, q)
+		return "", nil
 	}
 	raw, err := json.Marshal(p)
 	if err != nil {
-		return fmt.Errorf("encode policy: %w", err)
+		return "", fmt.Errorf("encode policy: %w", err)
 	}
 	if pe := contracts.CheckPolicy(string(raw)); pe != nil {
-		return pe
+		return "", pe
 	}
-	q.attrs[contracts.AttrPolicy] = string(raw)
-	return s.saveAttributes(ctx, tx, q)
+	return string(raw), nil
 }
 
-// AddPermission adds a statement to the queue's Policy, as SQS's
-// AddPermission generates one: the label as its Sid, allowing the accounts'
-// root users the actions on the queue.
-func (s *Service) AddPermission(ctx context.Context, name string, perm contracts.Permission) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error {
+// maxPolicyEdits bounds the attempts of editPolicy, each of which another
+// write of the queue's Policy can overtake.
+const maxPolicyEdits = 8
+
+// errPolicyContended is a Policy edit overtaken maxPolicyEdits times in a
+// row by other writes of the queue.
+var errPolicyContended = errors.New("the queue's Policy kept changing during the edit")
+
+// editPolicy applies edit to the queue's Policy and stores the result as
+// bind returns it, nil storing it as edited. bind may ask identity, so it
+// runs outside any transaction, which would hold the store's one
+// connection: the Policy is read and edited in one transaction, bound, and
+// written in a second only if the queue and its Policy are still those
+// that were read. Otherwise the edit starts again on what is stored now,
+// so a concurrent write is never lost.
+func (s *Service) editPolicy(ctx context.Context, name string,
+	edit func(p *policyDoc) error, bind contracts.BindFunc,
+) error {
+	for range maxPolicyEdits {
+		read, after, err := s.readEdited(ctx, name, edit)
+		if err != nil {
+			return err
+		}
+		if after != "" && bind != nil {
+			if after, err = bind(ctx, after); err != nil {
+				return err
+			}
+		}
+		written, err := s.writePolicyIf(ctx, name, read, after)
+		if err != nil || written {
+			return err
+		}
+	}
+	return fmt.Errorf("%s: %w", s.Name(), errPolicyContended)
+}
+
+// policyRead is the queue and Policy an edit was made on.
+type policyRead struct {
+	policy string
+	id     int64
+}
+
+// readEdited reads the queue's Policy and returns it with the edited one,
+// "" for none.
+func (s *Service) readEdited(ctx context.Context, name string, edit func(p *policyDoc) error,
+) (policyRead, string, error) {
+	var read policyRead
+	var after string
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		q, err := loadQueue(ctx, tx, name)
 		if err != nil {
 			return err
@@ -736,6 +778,48 @@ func (s *Service) AddPermission(ctx context.Context, name string, perm contracts
 		if err != nil {
 			return err
 		}
+		if err = edit(p); err != nil {
+			return err
+		}
+		read = policyRead{policy: q.attrs[contracts.AttrPolicy], id: q.id}
+		after, err = encodePolicy(p)
+		return err
+	})
+	return read, after, err
+}
+
+// writePolicyIf stores policy as the queue's Policy, "" removing it, when
+// the queue and its Policy are still read, and reports whether it did.
+func (s *Service) writePolicyIf(ctx context.Context, name string, read policyRead,
+	policy string,
+) (bool, error) {
+	written := false
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		q, err := loadQueue(ctx, tx, name)
+		if err != nil {
+			return err
+		}
+		if q.id != read.id || q.attrs[contracts.AttrPolicy] != read.policy {
+			return nil
+		}
+		written = true
+		if policy == "" {
+			delete(q.attrs, contracts.AttrPolicy)
+		} else {
+			q.attrs[contracts.AttrPolicy] = policy
+		}
+		return s.saveAttributes(ctx, tx, q)
+	})
+	return written, err
+}
+
+// AddPermission adds a statement to the queue's Policy, as SQS's
+// AddPermission generates one: the label as its Sid, allowing the accounts'
+// root users the actions on the queue.
+func (s *Service) AddPermission(ctx context.Context, name string, perm contracts.Permission,
+	bind contracts.BindFunc,
+) error {
+	return s.editPolicy(ctx, name, func(p *policyDoc) error {
 		for _, st := range p.Statement {
 			if sidOf(st) == perm.Label {
 				return &contracts.InvalidError{
@@ -759,22 +843,16 @@ func (s *Service) AddPermission(ctx context.Context, name string, perm contracts
 			return fmt.Errorf("encode statement: %w", err)
 		}
 		p.Statement = append(p.Statement, raw)
-		return s.savePolicy(ctx, tx, q, p)
-	})
+		return nil
+	}, bind)
 }
 
 // RemovePermission removes the statement whose Sid is label from the
 // queue's Policy.
-func (s *Service) RemovePermission(ctx context.Context, name, label string) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error {
-		q, err := loadQueue(ctx, tx, name)
-		if err != nil {
-			return err
-		}
-		p, err := s.queuePolicy(q)
-		if err != nil {
-			return err
-		}
+func (s *Service) RemovePermission(ctx context.Context, name, label string,
+	bind contracts.BindFunc,
+) error {
+	return s.editPolicy(ctx, name, func(p *policyDoc) error {
 		i := slices.IndexFunc(p.Statement, func(st json.RawMessage) bool {
 			return sidOf(st) == label
 		})
@@ -785,6 +863,6 @@ func (s *Service) RemovePermission(ctx context.Context, name, label string) erro
 			}
 		}
 		p.Statement = slices.Delete(p.Statement, i, i+1)
-		return s.savePolicy(ctx, tx, q, p)
-	})
+		return nil
+	}, bind)
 }

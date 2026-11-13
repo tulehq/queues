@@ -21,6 +21,9 @@ func (m *Module) createQueue(c *call) (any, error) {
 	if err = sqsapi.CheckTags(req.Tags); err != nil {
 		return nil, err
 	}
+	if err = m.bindAttributes(c, attrs); err != nil {
+		return nil, err
+	}
 	q, err := m.store.CreateQueue(c, contracts.CreateQueueInput{
 		Name: name, FIFO: fifo, Attributes: attrs, Tags: req.Tags,
 	})
@@ -147,6 +150,9 @@ func (m *Module) getQueueAttributes(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err = ShowPolicy(c, m.principals, attrs); err != nil {
+		return nil, err
+	}
 	return sqsapi.GetQueueAttributesResult{Attributes: attrs}, nil
 }
 
@@ -168,6 +174,9 @@ func (m *Module) setQueueAttributes(c *call) (any, error) {
 	}
 	attrs, err := sqsapi.CheckQueueAttributes(req.Attributes, q.Attributes, q.FIFO)
 	if err != nil {
+		return nil, err
+	}
+	if err = m.bindAttributes(c, attrs); err != nil {
 		return nil, err
 	}
 	return nil, m.store.SetQueueAttributes(c, name, attrs)
@@ -231,7 +240,7 @@ func (m *Module) addPermission(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return nil, m.store.AddPermission(c, name, p)
+	return nil, m.store.AddPermission(c, name, p, m.binder())
 }
 
 func (m *Module) removePermission(c *call) (any, error) {
@@ -250,5 +259,5 @@ func (m *Module) removePermission(c *call) (any, error) {
 	if err = sqsapi.CheckLabel(label); err != nil {
 		return nil, err
 	}
-	return nil, m.store.RemovePermission(c, name, label)
+	return nil, m.store.RemovePermission(c, name, label, m.binder())
 }

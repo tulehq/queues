@@ -4,6 +4,7 @@ package app
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/database"
 	"github.com/gasmod/gas/migrate"
+	"tule.dev/identity/principals"
 
 	"tule.dev/queues/internal/authz"
 	"tule.dev/queues/internal/contracts"
@@ -44,9 +46,14 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	// it, not on the clock SetClock sets for the queues.
 	authorizer := authz.New(cfg.Queues.AccountID, cfg.Queues.Region, time.Now)
 
+	pp, err := newPolicyPrincipals(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	registerInfraServices(app, cfg, logger)
 	registerAppServices(app, cfg)
-	registerAppModules(app, cfg, authorizer)
+	registerAppModules(app, cfg, authorizer, pp)
 
 	verifiers, err := newVerifiers(cfg)
 	if err != nil {
@@ -93,10 +100,33 @@ func registerAppServices(app *gas.App, cfg *Config) {
 		sqlimpl.NewService(cfg.Queues, cfg.clock()))
 }
 
-func registerAppModules(app *gas.App, cfg *Config, authorizer *authz.Authorizer) {
-	app.RegisterSingletonService[*queues.Module](queues.NewModule(cfg.Queues, authorizer))
-	app.RegisterSingletonService[*inspect.Module](inspect.NewModule(cfg.Queues))
+func registerAppModules(app *gas.App, cfg *Config, authorizer *authz.Authorizer,
+	pp contracts.PolicyPrincipals,
+) {
+	app.RegisterSingletonService[*queues.Module](queues.NewModule(cfg.Queues, authorizer, pp))
+	app.RegisterSingletonService[*inspect.Module](inspect.NewModule(cfg.Queues, pp))
 	app.RegisterSingletonService[*health.Module](health.NewModule)
+}
+
+// newPolicyPrincipals returns identity's principals client, which binds the
+// queue policies' principals to unique IDs when they are stored and shows
+// them as ARNs when they are read, or nil when queues runs standalone,
+// storing and showing them as sent. It asks identity with the root key, as
+// the key lookups do, and each call is bounded by identityTimeout.
+func newPolicyPrincipals(cfg *Config) (contracts.PolicyPrincipals, error) {
+	if cfg.Auth.IdentityEndpoint == "" {
+		return nil, nil
+	}
+	c, err := principals.New(principals.Config{
+		HTTPClient:      &http.Client{Timeout: identityTimeout},
+		Endpoint:        cfg.Auth.IdentityEndpoint,
+		AccessKeyID:     cfg.Auth.AccessKeyID,
+		SecretAccessKey: cfg.Auth.SecretAccessKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the principals client: %w", err)
+	}
+	return c, nil
 }
 
 func installMiddleware(

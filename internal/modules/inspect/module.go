@@ -43,15 +43,19 @@ type Module struct {
 	router   *gas.Router
 	store    contracts.QueueProvider
 	settings *contracts.QueueSettings
+	// principals shows the queue policies' principals, nil when the
+	// service runs standalone.
+	principals contracts.PolicyPrincipals
 }
 
 // NewModule returns the constructor gas uses to build a Module over store,
-// for the queues of settings' account.
-func NewModule(settings *contracts.QueueSettings) func(
+// for the queues of settings' account, showing the queue policies'
+// principals with principals, nil to show them as stored (standalone).
+func NewModule(settings *contracts.QueueSettings, principals contracts.PolicyPrincipals) func(
 	router *gas.Router, store contracts.QueueProvider,
 ) *Module {
 	return func(router *gas.Router, store contracts.QueueProvider) *Module {
-		return &Module{router: router, store: store, settings: settings}
+		return &Module{router: router, store: store, settings: settings, principals: principals}
 	}
 }
 
@@ -127,11 +131,16 @@ func (m *Module) listQueues(ctx gas.Context) error {
 	out := Page[Queue]{Items: make([]Queue, 0, len(qs))}
 	for _, q := range qs {
 		arn := m.settings.ARN(q.Name)
+		attrs := sqsapi.AllAttributes(q, arn)
+		// The policy is shown as GetQueueAttributes shows it.
+		if err = queues.ShowPolicy(ctx, m.principals, attrs); err != nil {
+			return writeError(ctx, err)
+		}
 		out.Items = append(out.Items, Queue{
 			Name:       q.Name,
 			URL:        queues.QueueURL(m.settings, ctx.Request(), q.Name),
 			ARN:        arn,
-			Attributes: sqsapi.AllAttributes(q, arn),
+			Attributes: attrs,
 			Counts: Counts{
 				Visible: q.Counts.Visible, InFlight: q.Counts.InFlight, Delayed: q.Counts.Delayed,
 			},

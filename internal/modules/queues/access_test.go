@@ -39,7 +39,7 @@ func loadReference(t *testing.T) serviceReference {
 }
 
 func routedOperations() []string {
-	m := NewModule(nil, nil)(nil, nil)
+	m := NewModule(nil, nil, nil)(nil, nil)
 	return slices.Sorted(maps.Keys(m.handlers))
 }
 

@@ -183,9 +183,28 @@ user or role the policy it needs, such as `sqs:*` on `*`.
   them never holds in an `Allow` and always holds in a `Deny`, whatever its
   operator, so the request is decided as the worst case for the caller
   (tule.dev/policy's "Unknown context keys").
+- With an identity endpoint, a queue policy's IAM user and role ARNs are
+  bound to the principals' unique IDs when it is stored, and shown as ARNs
+  again when it is read ([Queue policies](#queue-policies)). A user or role
+  deleted and created again under the same ARN is no longer granted what the
+  deleted one was, and a `Policy` naming a user or role that does not exist
+  is refused with `InvalidAttributeValue`, where v0.3.0 stored it.
+- **Policies stored by earlier releases are not bound.** A `Policy` stored
+  by v0.3.0 or earlier names its principals by ARN, and keeps matching them
+  by ARN, so a user or role created again under one of them is granted,
+  until the policy is written again: by `SetQueueAttributes` or
+  `CreateQueue`, or by `AddPermission` or `RemovePermission`, which bind the
+  whole policy they write. Nothing is bound on its own at upgrade. Such a
+  policy naming a user or role that no longer exists cannot be bound, so
+  `AddPermission` and `RemovePermission` on it fail with
+  `InvalidAttributeValue` for the `Policy` until the root key sets it again
+  without that principal. To bind every policy, read each queue's `Policy`
+  and set it again.
 - identity v0.5.0 or later is needed: queues asks identity's signing-key
-  endpoint for version 4, which carries the organization keys. An older
-  identity fails every evaluated request with `500` `InternalFailure`.
+  endpoint for version 4, which carries the organization keys, and its
+  principal-ID endpoint, which v0.5.0 added. An older identity fails every
+  evaluated request with `500` `InternalFailure`, and every write or read
+  of a policy naming a user or role.
 
 Each operation is evaluated as the action and resource the SQS Service
 Authorization Reference gives it (the table is `operationAccess` in
@@ -271,11 +290,13 @@ Gaps:
 - **Permissions boundaries, session policies, SCPs and RCPs** are not
   evaluated; where AWS lets them limit a queue policy's grant to a role, the
   grant here is unlimited.
-- **Stored principals are matched by ARN.** AWS turns a user or role ARN in
-  a stored resource-based policy into the principal's unique ID, so a
-  principal deleted and created again under the same name does not inherit
-  the grant. Here it does, until identity can resolve unique IDs for the
-  services. A session whose role was deleted is refused everything.
+- **Standalone, stored principals are matched by ARN.** Without an
+  identity endpoint there are no unique IDs to bind to: a policy is stored
+  as sent, and a user or role deleted and created again under the same ARN
+  would inherit its grant (no key but the root key is accepted then, so
+  nothing is evaluated). Policies stored by earlier releases are matched by
+  ARN until they are written again (see the v0.4.0 changes). A session
+  whose role was deleted is refused everything.
 - **Service principals never match.** No Tule caller is a service, so a
   statement naming `sqs.amazonaws.com` or `sns.amazonaws.com` grants
   nothing.
@@ -290,11 +311,64 @@ Gaps:
 A queue's policy is its `Policy` attribute, set with `CreateQueue` and
 `SetQueueAttributes` and read with `GetQueueAttributes`, and written one
 statement at a time by `AddPermission` and `RemovePermission`. A `Policy`
-set with `CreateQueue` or `SetQueueAttributes` is stored and returned as it
-was sent, white space and element order included. `AddPermission` and
+set with `CreateQueue` or `SetQueueAttributes` is returned as it was sent,
+white space and element order included, except for its principals, which
+with an identity endpoint are shown as below. `AddPermission` and
 `RemovePermission` write the policy again as JSON of their own: compact,
 with `Statement` always an array, and `Version`, `Id` and the statements'
 contents kept, so a policy they changed is returned in that form.
+
+**Principals are bound to unique IDs.** AWS turns a user or role ARN in a
+policy's `Principal` into the principal's unique ID when the policy is
+saved, so that a user or role deleted and created again under the same ARN
+is another principal, which the policy does not name, and shows the ID in
+place of the ARN once "AWS can no longer map it back to a valid ARN" (IAM
+User Guide, "AWS JSON policy elements: Principal"). With an identity
+endpoint, queues does the same through identity's principal-ID endpoint
+(`tule.dev/identity/principals`):
+
+- Every write of a `Policy`, `CreateQueue` and `SetQueueAttributes` with
+  one, and `AddPermission` and `RemovePermission`, binds the whole policy it
+  stores: each IAM user and role ARN in the `AWS` values of a `Principal` or
+  `NotPrincipal` becomes the unique ID (`AIDA...`, `AROA...`) of the IAM user or
+  role that has it now. Account IDs, root ARNs (all `AddPermission`
+  generates), session ARNs, `*`, unique IDs and ARNs in conditions, such as
+  `aws:PrincipalArn`, are kept. Where an ID replaces an ARN, the white
+  space of the object it is in is not kept.
+- An ARN no user or role has is refused as SQS refuses it: "Amazon SQS
+  validates the resource policy and checks for the IAM entity. If the IAM
+  entity doesn't exist, you will receive an error" ("Troubleshoot Amazon
+  SQS API errors", SQS Developer Guide, under `InvalidAttributeValue`). The
+  error is `InvalidAttributeValue`, "Invalid value for the parameter Policy.
+  Reason: Invalid principal in policy: <ARN>"; SQS's wording is not
+  documented. `AddPermission` and `RemovePermission` answer the same for a
+  policy stored by an earlier release that names one; SQS lists no such
+  error for them, since a policy it stored is always bound.
+- Every read, `GetQueueAttributes` asking for `Policy` (or `All`) and the
+  [inspection API](#inspection-api), shows each unique ID that a user or
+  role still has as its current ARN, and leaves one that no user or role
+  has as the ID. So a policy is returned as sent, except that its
+  principals are shown this way: the ARN while the principal exists, the
+  old principal's ID once it was deleted, even when a user or role of the
+  same name exists again.
+- Evaluation uses the stored, bound policy, and asks identity nothing:
+  tule.dev/policy matches a unique ID against the caller's `aws:userid`.
+- Identity failing or unreachable fails the write, which stores nothing,
+  and the read, with `500` `InternalFailure`, logged. A policy that names
+  no user or role, or ID of one, needs no call, and nor does a request
+  that neither writes nor reads a `Policy`.
+- `AddPermission` and `RemovePermission` read and edit the policy, ask
+  identity outside the store's transaction, and write the result only if
+  the queue's `Policy` is still the one they read, starting again
+  otherwise, so a policy written meanwhile is never lost. One overtaken 8
+  times in a row fails with `500` `InternalFailure`.
+- `CreateQueue` for a queue that exists compares the bound `Policy`, so
+  the same request after a principal it names was created again under its
+  ARN, or against a policy an earlier release stored unbound, is
+  `QueueNameExists` (`QueueAlreadyExists`), as for any other attribute that
+  differs.
+
+Standalone, a policy is stored and shown as sent, and matched by ARN.
 
 `CreateQueue` and `SetQueueAttributes` refuse, with `InvalidAttributeValue`
 ("Invalid value for the parameter Policy. Reason: ..."), the error SQS
@@ -314,9 +388,10 @@ SQS API errors"), a `Policy` that:
   principal is refused), unique `Sid`s of any characters. The reason is
   the parser's message; SQS's wording is not documented.
 
-SQS also refuses a principal ARN that names no existing IAM entity; this
-service does not ask identity, so such a policy is stored and its
-statement matches nobody until the entity exists. A statement's `Resource`
+With an identity endpoint, a principal ARN that names no existing user or
+role is refused too (above); standalone, such a policy is stored and its
+statement matches nobody until a principal of that ARN exists. A
+statement's `Resource`
 is not required to name the queue, nor its `Action` to be an SQS action:
 the SQS documentation does not say that SQS refuses either (its own
 examples use wildcards such as `arn:aws:sqs:*:111122223333:queue1`), so

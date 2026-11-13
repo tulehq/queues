@@ -203,6 +203,20 @@ type Permission struct {
 	Actions    []string
 }
 
+// PolicyPrincipals binds the principals of a queue policy when it is
+// stored and shows them when it is read, as identity's principals client
+// does: Bind replaces each IAM user and role ARN with the principal's
+// unique ID, and Show turns each unique ID a user or role still has back
+// into its ARN.
+type PolicyPrincipals interface {
+	Bind(ctx context.Context, doc string) (string, error)
+	Show(ctx context.Context, doc string) (string, error)
+}
+
+// BindFunc returns the document to store for a queue policy that passed
+// CheckPolicy, or an error to refuse it with.
+type BindFunc func(ctx context.Context, doc string) (string, error)
+
 // QueueAccess is what authorizing a request on a queue reads of it, read
 // together: the ID the request is pinned to (WithQueuePin), the tags for
 // aws:ResourceTag/<key>, and the queue's Policy attribute, "" when it has
@@ -256,8 +270,11 @@ type QueueProvider interface {
 	// RedrivePolicy targets the queue.
 	ListDeadLetterSourceQueues(ctx context.Context, name string,
 		page PageInput) (*Page[string], error)
-	AddPermission(ctx context.Context, name string, p Permission) error
-	RemovePermission(ctx context.Context, name, label string) error
+	// AddPermission and RemovePermission write the queue's Policy with a
+	// statement added or removed, as bind returns it; nil stores it as
+	// written.
+	AddPermission(ctx context.Context, name string, p Permission, bind BindFunc) error
+	RemovePermission(ctx context.Context, name, label string, bind BindFunc) error
 
 	// SendMessages sends messages in order, all or none.
 	SendMessages(ctx context.Context, name string, msgs []SendInput) ([]SendResult, error)

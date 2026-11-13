@@ -43,7 +43,8 @@ func (s *pinStore) QueueInfo(ctx context.Context, name string) (*contracts.Queue
 func TestTheOperationRunsPinnedToTheEvaluatedQueue(t *testing.T) {
 	settings := &contracts.QueueSettings{AccountID: "000000000000", Region: "us-east-1"}
 	store := &pinStore{}
-	m := NewModule(settings, authz.New(settings.AccountID, settings.Region, time.Now))(nil, store)
+	az := authz.New(settings.AccountID, settings.Region, time.Now)
+	m := NewModule(settings, az, nil)(nil, store)
 
 	body := `{"QueueUrl":"http://queues.local/000000000000/orders","MessageBody":"x"}`
 	r := httptest.NewRequest(http.MethodPost, "http://queues.local/", strings.NewReader(body))
@@ -92,7 +93,8 @@ func runHandler(h handler, c *call) (err error) {
 
 func TestAuthorizationAndTheOperationShareOneDecoding(t *testing.T) {
 	settings := &contracts.QueueSettings{AccountID: "000000000000", Region: "us-east-1"}
-	m := NewModule(settings, authz.New(settings.AccountID, settings.Region, time.Now))(nil, nil)
+	az := authz.New(settings.AccountID, settings.Region, time.Now)
+	m := NewModule(settings, az, nil)(nil, nil)
 	body := `{"QueueUrl":"http://queues.local/000000000000/orders","QueueName":"orders"}`
 
 	for op, a := range operationAccess {
