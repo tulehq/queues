@@ -35,6 +35,7 @@ type orgStack struct {
 	// memberSession is that session's credentials.
 	memberSession aws.Credentials
 	member        string
+	accountsURL   string
 }
 
 func startOrgStack(t *testing.T) *orgStack {
@@ -60,7 +61,8 @@ func startOrgStack(t *testing.T) *orgStack {
 				AccessKeyID: identityRootKeyID, SecretAccessKey: identityRootSecret,
 			},
 		},
-		member: member,
+		member:      member,
+		accountsURL: accountsURL,
 	}
 	s.identity = startIdentity(t, identityPort, "TULE_Identity_AccountsEndpoint="+accountsURL)
 	s.srv = startServer(t, map[string]string{
