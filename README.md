@@ -114,8 +114,10 @@ evaluation logic" describe:
   `UntagQueue` are never shared across accounts: "Cross-account
   permissions don't apply to the following actions" (SQS Developer Guide,
   "Basic examples of Amazon SQS policies", and each one's API reference). A
-  principal of another account is evaluated on them without the queue's
-  policy, so nothing grants them to it.
+  principal of another account is evaluated on them with the queue's
+  policy, so a `Deny` in it denies with its own message, but an `Allow`
+  in it is not enough: the request is denied "because no resource-based
+  policy allows" it.
 
 A request no policy allows fails with `403` `AccessDenied`, the code SQS
 sends in Query and in the JSON protocol's `x-amzn-query-error` header (the
@@ -269,8 +271,12 @@ Gaps:
 
 A queue's policy is its `Policy` attribute, set with `CreateQueue` and
 `SetQueueAttributes` and read with `GetQueueAttributes`, and written one
-statement at a time by `AddPermission` and `RemovePermission`. It is stored
-and returned as it was sent.
+statement at a time by `AddPermission` and `RemovePermission`. A `Policy`
+set with `CreateQueue` or `SetQueueAttributes` is stored and returned as it
+was sent, white space and element order included. `AddPermission` and
+`RemovePermission` write the policy again as JSON of their own: compact,
+with `Statement` always an array, and `Version`, `Id` and the statements'
+contents kept, so a policy they changed is returned in that form.
 
 `CreateQueue` and `SetQueueAttributes` refuse, with `InvalidAttributeValue`
 ("Invalid value for the parameter Policy. Reason: ..."), the error SQS
@@ -292,7 +298,11 @@ SQS API errors"), a `Policy` that:
 
 SQS also refuses a principal ARN that names no existing IAM entity; this
 service does not ask identity, so such a policy is stored and its
-statement matches nobody until the entity exists.
+statement matches nobody until the entity exists. A statement's `Resource`
+is not required to name the queue, nor its `Action` to be an SQS action:
+the SQS documentation does not say that SQS refuses either (its own
+examples use wildcards such as `arn:aws:sqs:*:111122223333:queue1`), so
+such a statement is stored and applies to the requests it matches.
 
 `AddPermission` adds an `Allow` statement whose `Sid` is the label, whose
 `Principal` is `{"AWS": [...]}` with `arn:aws:iam::<id>:root` for each of
