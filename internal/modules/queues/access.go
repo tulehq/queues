@@ -95,8 +95,8 @@ var operationAccess = map[string]access{
 // (SQS Developer Guide, "Basic examples of Amazon SQS policies", Example
 // 4, and each operation's API reference): a queue policy grants them to
 // principals of the queue's own account only. A principal of another
-// account is evaluated on them without the queue's policy, so nothing
-// grants it them.
+// account is evaluated on them with the queue's policy, so a Deny in it
+// applies, but nothing grants them to it (authz.Check.Unshared).
 var ownerOnly = map[string]bool{
 	"AddPermission": true, "CreateQueue": true, "DeleteQueue": true, "ListQueues": true,
 	"ListQueueTags": true, "RemovePermission": true, "SetQueueAttributes": true,
@@ -148,8 +148,8 @@ func (m *Module) authorize(c *call) error {
 	if !ok {
 		return errors.New("authorize: the request carries no verified principal")
 	}
-	if m.authorizer.IsRoot(p) {
-		return nil
+	if root, err := m.authorizer.IsRoot(p); err != nil || root {
+		return err //nolint:wrapcheck // a fault ToError logs
 	}
 	a, ok := operationAccess[c.op]
 	if !ok {
@@ -159,6 +159,30 @@ func (m *Module) authorize(c *call) error {
 	if err != nil {
 		return err
 	}
+	resource, ctx, pol, err := m.facts(c, t)
+	if err != nil {
+		return err
+	}
+	check := authz.Check{
+		Action: a.action, Resource: resource, Context: ctx, Policy: pol,
+		Unshared: ownerOnly[c.op],
+	}
+	checks := []authz.Check{check}
+	if t.alsoTag {
+		check.Action = tagQueueAction
+		checks = append(checks, check)
+	}
+	return m.authorizer.Authorize(
+		c.Request(),
+		p,
+		checks...) //nolint:wrapcheck // an *authz.Denied, or a fault ToError logs
+}
+
+// facts returns what t is evaluated on: the queue's ARN, or "*", the
+// request's context with the queue's tags, and the queue's parsed policy.
+func (m *Module) facts(c *call, t accessTarget) (
+	string, map[string][]string, *policy.Policy, error,
+) {
 	// The resource is rebuilt from the configured partition, region and
 	// account and the queue's name, never taken from the request: a queue
 	// URL names its queue by path, and one of another account is answered
@@ -168,46 +192,23 @@ func (m *Module) authorize(c *call) error {
 		resource = m.settings.ARN(t.queue)
 	}
 	ctx := t.context
-	var doc string
+	var (
+		doc string
+		err error
+	)
 	// The tags are read whatever the policies say: deciding from a
 	// policy's bytes whether it asks for them would differ from the parser,
 	// which reads escaped key names.
 	if t.exists {
 		if ctx, doc, err = m.readQueue(c, t, ctx); err != nil {
-			return err
+			return "", nil, nil, err
 		}
-	}
-	pol, err := m.queuePolicy(c.op, p, t.queue, doc)
-	if err != nil {
-		return err
-	}
-	checks := []authz.Check{{Action: a.action, Resource: resource, Context: ctx, Policy: pol}}
-	if t.alsoTag {
-		checks = append(checks, authz.Check{
-			Action: tagQueueAction, Resource: resource, Context: ctx, Policy: pol,
-		})
-	}
-	return m.authorizer.Authorize(
-		c.Request(),
-		p,
-		checks...) //nolint:wrapcheck // an *authz.Denied, or a fault ToError logs
-}
-
-// queuePolicy parses the queue's stored Policy, doc, for an evaluation of
-// op by p: none for a principal of another account on an owner-only
-// operation. A stored policy that cannot be evaluated fails the request
-// (fail closed).
-func (m *Module) queuePolicy(
-	op string, p sigv4.Principal, queue, doc string,
-) (*policy.Policy, error) {
-	if ownerOnly[op] && p.AccountID != m.settings.AccountID {
-		return nil, nil
 	}
 	pol, err := m.authorizer.ResourcePolicy(doc)
 	if err != nil {
-		return nil, fmt.Errorf("authorize: queue %s: %w", queue, err)
+		return "", nil, nil, fmt.Errorf("authorize: queue %s: %w", t.queue, err)
 	}
-	return pol, nil
+	return resource, ctx, pol, nil
 }
 
 // readQueue adds aws:ResourceTag/<key> for each of the queue's tags to

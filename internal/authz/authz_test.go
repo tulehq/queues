@@ -364,8 +364,8 @@ func TestAnotherAccountsPrincipalNeedsBothPolicies(t *testing.T) {
 	// Another account's root user is not root here; it has every
 	// identity-based permission in its account, and needs the grant.
 	root := principal("arn:aws:iam::444455556666:root")
-	if a.IsRoot(root) {
-		t.Fatal("another account's root principal is root here")
+	if isRoot, err := a.IsRoot(root); isRoot || err != nil {
+		t.Fatalf("another account's root principal: IsRoot = %t, %v", isRoot, err)
 	}
 	requireDenied(t, authorize(t, a, root, check), "sqs:SendMessage", queueARN,
 		policy.NoResourceAllow)
@@ -441,17 +441,44 @@ func TestRootAndTypeOutOfStepAreAFault(t *testing.T) {
 	check := Check{Action: "sqs:SendMessage", Resource: queueARN}
 	accountNotRoot := principal("arn:aws:iam::444455556666:root", allow("*", "*"))
 	accountNotRoot.Root = false
-	rootUser := principal(userARN, allow("*", "*"))
+	// A user of the service's own account marked Root would otherwise skip
+	// evaluation as the account's root user.
+	rootUser := principal(userARN, deny("*", "*"))
 	rootUser.Root = true
-	rootUser.AccountID = "444455556666"
 	for name, p := range map[string]sigv4.Principal{
 		"Type Account without Root": accountNotRoot,
 		"Root on a user":            rootUser,
 	} {
+		if isRoot, err := a.IsRoot(p); isRoot || !errors.Is(err, errPrincipal) {
+			t.Errorf("%s: IsRoot = %t, %v; want errPrincipal", name, isRoot, err)
+		}
 		err := authorize(t, a, p, check)
 		var d *Denied
 		if !errors.Is(err, errPrincipal) || errors.As(err, &d) {
 			t.Errorf("%s: error = %v, want errPrincipal", name, err)
 		}
+	}
+}
+
+func TestAnUnsharedActionIsNeverGrantedAcrossAccounts(t *testing.T) {
+	a := newAuthorizer()
+	allowAll := queuePolicy(t, "Allow", `"*"`)
+	check := Check{
+		Action: "sqs:SendMessage", Resource: queueARN, Policy: allowAll, Unshared: true,
+	}
+	// Both policies allow it, and it is still denied for another account.
+	requireDenied(t, authorize(t, a, memberPrincipal(allow("*", "*")), check),
+		"sqs:SendMessage", queueARN, policy.NoResourceAllow)
+	// A Deny in the queue policy keeps its own message.
+	denied := check
+	denied.Policy = queuePolicy(t, "Deny", `"*"`)
+	requireDenied(t, authorize(t, a, memberPrincipal(allow("*", "*")), denied),
+		"sqs:SendMessage", queueARN, policy.ResourceDeny)
+	// And a missing identity Allow keeps its.
+	requireDenied(t, authorize(t, a, memberPrincipal(), check),
+		"sqs:SendMessage", queueARN, policy.NoIdentityAllow)
+	// Within the account the queue policy grants it as usual.
+	if err := authorize(t, a, principal(userARN), check); err != nil {
+		t.Fatalf("a principal of the account: %v", err)
 	}
 }
