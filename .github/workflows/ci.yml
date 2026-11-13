@@ -31,12 +31,13 @@ jobs:
       # accounts services from their source, accounts so that identity's
       # AssumeRole can ask it about member accounts. They run against the
       # siblings' released versions, not their main branches; move the pins
-      # when they release. Identity v0.1.0 works with accounts v0.2.0, since
-      # identity calls accounts only with the root key.
+      # when they release. Identity v0.2.0, the first to hand over identity
+      # policies, works with accounts v0.2.0, since identity calls accounts
+      # only with the root key.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: tulehq/identity
-          ref: v0.1.0
+          ref: v0.2.0
           path: identity
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

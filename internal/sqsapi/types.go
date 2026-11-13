@@ -1,7 +1,9 @@
 package sqsapi
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/xml"
 	"slices"
 )
@@ -111,7 +113,7 @@ func sortedKeys[V any](m map[string]V) []string {
 // member "tags", in lower case.
 type CreateQueueRequest struct {
 	Attributes map[string]string `json:"Attributes"`
-	Tags       map[string]string `json:"tags"`
+	Tags       RequestTags       `json:"tags"`
 	QueueName  *string           `json:"QueueName"`
 }
 
@@ -180,8 +182,8 @@ type SetQueueAttributesRequest struct {
 
 // TagQueueRequest is the input of TagQueue.
 type TagQueueRequest struct {
-	Tags     map[string]string `json:"Tags"`
-	QueueURL *string           `json:"QueueUrl"`
+	Tags     RequestTags `json:"Tags"`
+	QueueURL *string     `json:"QueueUrl"`
 }
 
 // UntagQueueRequest is the input of UntagQueue.
@@ -353,4 +355,54 @@ type ChangeMessageVisibilityBatchRequest struct {
 type ChangeMessageVisibilityBatchResult struct {
 	Successful []BatchResultEntry      `json:"Successful" xml:"ChangeMessageVisibilityBatchResultEntry"`
 	Failed     []BatchResultErrorEntry `json:"Failed"     xml:"BatchResultErrorEntry"`
+}
+
+// RequestTags are the tags a CreateQueue or TagQueue request sets. In JSON
+// they are an object of strings in which no key may repeat: encoding/json
+// would keep the last value silently.
+type RequestTags map[string]string
+
+// UnmarshalJSON reads the tags object, refusing a repeated key with
+// InvalidParameterValue and anything but an object of strings, or null,
+// with SerializationException.
+func (t *RequestTags) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return ErrSerialization()
+	}
+	if tok == nil {
+		*t = nil
+		return nil
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return ErrSerialization()
+	}
+	out := RequestTags{}
+	for dec.More() {
+		key, kErr := stringToken(dec)
+		val, vErr := stringToken(dec)
+		if kErr != nil || vErr != nil {
+			return ErrSerialization()
+		}
+		if _, dup := out[key]; dup {
+			return errRepeatedTagKey(key)
+		}
+		out[key] = val
+	}
+	*t = out
+	return nil
+}
+
+// stringToken reads the next token, which must be a string.
+func stringToken(dec *json.Decoder) (string, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return "", err //nolint:wrapcheck // replaced by ErrSerialization
+	}
+	s, ok := tok.(string)
+	if !ok {
+		return "", ErrSerialization()
+	}
+	return s, nil
 }

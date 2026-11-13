@@ -39,15 +39,19 @@ const (
 )
 
 type identityStack struct {
-	srv       *server
-	identity  *identityProcess
-	iam       *iam.Client
-	rootCreds aws.Credentials
+	srv         *server
+	identity    *identityProcess
+	iam         *iam.Client
+	identityURL string
+	rootCreds   aws.Credentials
 }
 
 func TestIdentityIssuedKeys(t *testing.T) {
 	s := startIdentityStack(t)
 	userKey := createUserKey(t, s.iam, "dev")
+	// Since v0.2.0 a key identity issued is evaluated against its policies,
+	// so the user needs these calls and the inspection API allowed.
+	putUserPolicy(t, s.iam, "dev", allowAllQueuesPolicy)
 
 	t.Run("a user key works", func(t *testing.T) {
 		c := sqsClientWith(s.srv, userKey)
@@ -73,6 +77,7 @@ func startIdentityStack(t *testing.T) *identityStack {
 	port := identityFreePort(t)
 	identityURL := "http://127.0.0.1:" + strconv.Itoa(port)
 	s := &identityStack{
+		identityURL: identityURL,
 		rootCreds: aws.Credentials{
 			AccessKeyID:     identityRootKeyID,
 			SecretAccessKey: identityRootSecret,
@@ -101,6 +106,7 @@ func (s *identityStack) testInactiveKey(t *testing.T) {
 
 func (s *identityStack) testDeletedKey(t *testing.T) {
 	key := createUserKey(t, s.iam, "deleted")
+	putUserPolicy(t, s.iam, "deleted", allowAllQueuesPolicy)
 	_, err := sqsClientWith(s.srv, key).ListQueues(t.Context(), &sqs.ListQueuesInput{})
 	requireNoErr(t, err, "list queues before the key is deleted")
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +21,72 @@ import (
 // examples also show the lists and maps of one item without the index
 // (AttributeName=All, Attribute.Name=..., Tag.Key=...), which are read too.
 type Params url.Values
+
+// canonicalIndex is the one spelling of a list index the form accepts.
+var canonicalIndex = regexp.MustCompile(`^[1-9][0-9]*$`)
+
+// CheckForm refuses a Query form that could be read two ways, with
+// MalformedQueryString, before anything reads it:
+//
+//   - a list index spelled other than [1-9][0-9]* (Tag.01, Tag.+1, Tag.0),
+//     which strconv.Atoi would read as the index of another spelling, the
+//     later in map order winning;
+//   - a list given both indexed and in the one-item shorthand (Tag.1.Key
+//     and Tag.Key, or AttributeName.1 and AttributeName), which would be
+//     read as two items or one.
+//
+// A segment is an index when strconv.Atoi reads it, as the decoders read
+// them. The SQS API reference documents no answer for these forms.
+//
+// A parameter given more than once is not refused: its first value is
+// read, every time, and authorization and the operation share one decoding.
+// Some Query clients send ReceiveMessage's AttributeNames and
+// MessageSystemAttributeNames both as AttributeName.N.
+func CheckForm(form url.Values) error {
+	seen := map[string]*formKinds{}
+	for key := range form {
+		if err := markKey(seen, key); err != nil {
+			return err
+		}
+	}
+	for _, k := range seen {
+		if k.indexed && (k.named || k.whole) {
+			return ErrMalformedQueryString()
+		}
+	}
+	return nil
+}
+
+// formKinds records how a form's names continue a prefix: with an index,
+// with a member name, or not at all (the prefix is itself a name).
+type formKinds struct{ indexed, named, whole bool }
+
+// markKey records in seen how key continues each of its prefixes, refusing
+// an index that is not canonical.
+func markKey(seen map[string]*formKinds, key string) error {
+	at := func(prefix string) *formKinds {
+		k := seen[prefix]
+		if k == nil {
+			k = &formKinds{}
+			seen[prefix] = k
+		}
+		return k
+	}
+	at(key).whole = true
+	segs := strings.Split(key, ".")
+	for i := 1; i < len(segs); i++ {
+		prefix := strings.Join(segs[:i], ".")
+		if _, err := strconv.Atoi(segs[i]); err != nil {
+			at(prefix).named = true
+			continue
+		}
+		if !canonicalIndex.MatchString(segs[i]) {
+			return ErrMalformedQueryString()
+		}
+		at(prefix).indexed = true
+	}
+	return nil
+}
 
 // get returns a parameter, or nil when the request leaves it out.
 func (p Params) get(name string) *string {
@@ -121,9 +188,22 @@ func (p Params) list(name string) []string {
 	return out
 }
 
+// tagMap returns the flattened tags Tag.N.Key/Tag.N.Value, or nil when the
+// request sets none, refusing a key that two entries repeat.
+func (p Params) tagMap() (RequestTags, error) {
+	m, err := p.stringMapOf("Tag", "Key", true)
+	return RequestTags(m), err
+}
+
 // stringMap returns the flattened map prefix.N.<key>/prefix.N.Value, or
 // nil when the request sets none of it.
 func (p Params) stringMap(prefix, key string) (map[string]string, error) {
+	return p.stringMapOf(prefix, key, false)
+}
+
+// stringMapOf is stringMap; with unique, a key two entries repeat is
+// refused rather than the later entry winning.
+func (p Params) stringMapOf(prefix, key string, unique bool) (map[string]string, error) {
 	groups := p.grouped(prefix, true)
 	if len(groups) == 0 {
 		return nil, nil
@@ -137,6 +217,9 @@ func (p Params) stringMap(prefix, key string) (map[string]string, error) {
 		v := g.get("Value")
 		if v == nil {
 			return nil, ErrMissingParameter(prefix + ".N.Value")
+		}
+		if _, dup := out[*k]; dup && unique {
+			return nil, errRepeatedTagKey(*k)
 		}
 		out[*k] = *v
 	}
@@ -189,7 +272,7 @@ func (p Params) Decode(v any) error {
 		if req.Attributes, err = p.stringMap("Attribute", "Name"); err != nil {
 			return err
 		}
-		req.Tags, err = p.stringMap("Tag", "Key")
+		req.Tags, err = p.tagMap()
 	case *GetQueueURLRequest:
 		req.QueueName = p.get("QueueName")
 		req.QueueOwnerAWSAccountID = p.get("QueueOwnerAWSAccountId")
@@ -211,7 +294,7 @@ func (p Params) Decode(v any) error {
 		req.Attributes, err = p.stringMap("Attribute", "Name")
 	case *TagQueueRequest:
 		req.QueueURL = p.get("QueueUrl")
-		req.Tags, err = p.stringMap("Tag", "Key")
+		req.Tags, err = p.tagMap()
 	case *UntagQueueRequest:
 		req.QueueURL = p.get("QueueUrl")
 		req.TagKeys = p.list("TagKey")

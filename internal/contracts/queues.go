@@ -34,6 +34,17 @@ var (
 	ErrInvalidToken = errors.New("queues: invalid page token")
 )
 
+// TagKeyCaseError is a TagQueue under a pinned context (an evaluated
+// request) that would leave the queue with two tag keys differing only by
+// case, Key being one the request adds.
+type TagKeyCaseError struct {
+	Key string
+}
+
+func (e *TagKeyCaseError) Error() string {
+	return "queues: tag key " + e.Key + " differs only by case from another tag key"
+}
+
 // ReceiptError is returned for a receipt handle that names no receive of a
 // message of the queue: malformed, issued for another queue, or of a message
 // that is gone.
@@ -228,6 +239,8 @@ type QueueProvider interface {
 	TagQueue(ctx context.Context, name string, tags map[string]string) error
 	UntagQueue(ctx context.Context, name string, keys []string) error
 	ListQueueTags(ctx context.Context, name string) (map[string]string, error)
+	// QueueTags returns the queue's ID and tags, read together.
+	QueueTags(ctx context.Context, name string) (QueueID, map[string]string, error)
 	// ListDeadLetterSourceQueues lists the names of the queues whose
 	// RedrivePolicy targets the queue.
 	ListDeadLetterSourceQueues(ctx context.Context, name string,

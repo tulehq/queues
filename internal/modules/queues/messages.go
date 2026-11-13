@@ -39,8 +39,8 @@ func sendResult(in *contracts.SendInput, res contracts.SendResult) sqsapi.SendMe
 }
 
 func (m *Module) sendMessage(c *call) (any, error) {
-	var req sqsapi.SendMessageRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.SendMessageRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -75,8 +75,8 @@ func (m *Module) sendMessage(c *call) (any, error) {
 // reports each failed entry with its error. Entries that fail their checks
 // do not stop the rest.
 func (m *Module) sendMessageBatch(c *call) (any, error) {
-	var req sqsapi.SendMessageBatchRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.SendMessageBatchRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -174,15 +174,15 @@ func batchErrors(c *call, ids []string, errs []error, successful *[]sqsapi.Batch
 }
 
 func (m *Module) receiveMessage(c *call) (any, error) {
-	var req sqsapi.ReceiveMessageRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.ReceiveMessageRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
 	if err != nil {
 		return nil, err
 	}
-	if err = sqsapi.CheckReceive(&req); err != nil {
+	if err = sqsapi.CheckReceive(req); err != nil {
 		return nil, err
 	}
 	systemNames := slices.Concat(req.AttributeNames, req.MessageSystemAttributeNames)
@@ -211,8 +211,8 @@ func (m *Module) receiveMessage(c *call) (any, error) {
 }
 
 func (m *Module) deleteMessage(c *call) (any, error) {
-	var req sqsapi.DeleteMessageRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.DeleteMessageRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -231,8 +231,8 @@ func (m *Module) deleteMessage(c *call) (any, error) {
 }
 
 func (m *Module) deleteMessageBatch(c *call) (any, error) {
-	var req sqsapi.DeleteMessageBatchRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.DeleteMessageBatchRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -265,8 +265,8 @@ func (m *Module) deleteMessageBatch(c *call) (any, error) {
 }
 
 func (m *Module) changeMessageVisibility(c *call) (any, error) {
-	var req sqsapi.ChangeMessageVisibilityRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.ChangeMessageVisibilityRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -285,8 +285,8 @@ func (m *Module) changeMessageVisibility(c *call) (any, error) {
 }
 
 func (m *Module) changeMessageVisibilityBatch(c *call) (any, error) {
-	var req sqsapi.ChangeMessageVisibilityBatchRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.ChangeMessageVisibilityBatchRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)

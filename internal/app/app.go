@@ -12,6 +12,7 @@ import (
 	"github.com/gasmod/gas/database"
 	"github.com/gasmod/gas/migrate"
 
+	"tule.dev/queues/internal/authz"
 	"tule.dev/queues/internal/contracts"
 	"tule.dev/queues/internal/httpx"
 	"tule.dev/queues/internal/modules/health"
@@ -39,15 +40,19 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	opts := append([]gas.Option{gas.WithCSRFInsecureBypassPattern("/")}, extra...)
 	app := gas.NewApp(opts...)
 
+	// Policies are evaluated on the real time, as signatures are checked on
+	// it, not on the clock SetClock sets for the queues.
+	authorizer := authz.New(cfg.Queues.AccountID, cfg.Queues.Region, time.Now)
+
 	registerInfraServices(app, cfg, logger)
 	registerAppServices(app, cfg)
-	registerAppModules(app, cfg)
+	registerAppModules(app, cfg, authorizer)
 
 	verifiers, err := newVerifiers(cfg)
 	if err != nil {
 		return nil, err
 	}
-	installMiddleware(app.Router(), cfg, logger, verifiers)
+	installMiddleware(app.Router(), cfg, logger, verifiers, authorizer)
 
 	return app, nil
 }
@@ -88,13 +93,16 @@ func registerAppServices(app *gas.App, cfg *Config) {
 		sqlimpl.NewService(cfg.Queues, cfg.clock()))
 }
 
-func registerAppModules(app *gas.App, cfg *Config) {
-	app.RegisterSingletonService[*queues.Module](queues.NewModule(cfg.Queues))
+func registerAppModules(app *gas.App, cfg *Config, authorizer *authz.Authorizer) {
+	app.RegisterSingletonService[*queues.Module](queues.NewModule(cfg.Queues, authorizer))
 	app.RegisterSingletonService[*inspect.Module](inspect.NewModule(cfg.Queues))
 	app.RegisterSingletonService[*health.Module](health.NewModule)
 }
 
-func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifiers *verifiers) {
+func installMiddleware(
+	r *gas.Router, cfg *Config, logger gas.Logger, verifiers *verifiers,
+	authorizer *authz.Authorizer,
+) {
 	r.UseMiddlewareFunc(nil, httpx.RequestID(cfg.Env))
 
 	// No X-Forwarded-For handling: nothing is expected in front of this
@@ -106,6 +114,8 @@ func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifiers 
 	r.UseMiddlewareFunc(nil, gas.RequestLogger[httpx.RequestLogger]())
 
 	r.UseMiddlewareFunc(nil, verifySignature(verifiers))
+
+	r.UseMiddlewareFunc(nil, authorizeInspection(authorizer, cfg.Queues))
 
 	var hsts string
 	if cfg.HSTS != nil && cfg.HSTS.MaxAge > 0 {

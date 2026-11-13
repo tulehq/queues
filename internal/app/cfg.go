@@ -23,8 +23,9 @@ type hstsSettings struct {
 // authSettings holds the root key the server accepts. Every request must be
 // SigV4-signed with it, so both key fields are required. IdentityEndpoint is
 // the identity service's base URL, or empty to run standalone: set, a key
-// identity issued is accepted too, and identity is asked with the root key,
-// which must therefore be identity's root key as well.
+// identity issued is accepted too, and evaluated against its identity
+// policies, and identity is asked with the root key, which must therefore be
+// identity's root key as well.
 type authSettings struct {
 	AccessKeyID      string
 	SecretAccessKey  string

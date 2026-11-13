@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
+	"tule.dev/queues/internal/authz"
 	"tule.dev/queues/internal/contracts"
 	"tule.dev/queues/internal/httpx"
 )
@@ -112,6 +114,7 @@ const (
 	CodeInvalidClientTokenID  = "InvalidClientTokenId"
 	CodeExpiredToken          = "ExpiredToken"
 	CodeSerialization         = "SerializationException"
+	CodeAccessDenied          = "AccessDenied"
 )
 
 // NewError builds a common error with the given status and code.
@@ -170,6 +173,18 @@ func ErrSerialization() *Error {
 func ErrInternal() *Error {
 	return NewError(http.StatusInternalServerError, CodeInternalFailure,
 		"The request processing has failed because of an unknown error, exception or failure.")
+}
+
+// ErrAccessDenied is the error for a request the caller's identity policies
+// do not allow: 403 AccessDenied, the code SQS sends in Query and in
+// x-amzn-query-error ("Troubleshoot an access denied error in Amazon SQS",
+// SQS Developer Guide), which the SQS model has no shape for. The message
+// is IAM's form, with the action in lower case as SQS writes it in its
+// AccessDenied messages (as reported by SQS users; no AWS page gives an
+// identity-policy denial's exact text).
+func ErrAccessDenied(d *authz.Denied) *Error {
+	return NewError(http.StatusForbidden, CodeAccessDenied,
+		authz.Message(d.Principal, strings.ToLower(d.Action), d.Resource, d.Reason))
 }
 
 // ErrQueueDoesNotExist is the error for a queue URL or name no queue has.
@@ -249,6 +264,24 @@ func errBatchTooLong(n int) *Error {
 		MaxMessageSize, n))
 }
 
+// errRepeatedTagKey is the error for a request that gives one tag key two
+// values. SQS documents no answer for it (TagQueue, CreateQueue); refusing
+// it keeps the value stored and the value a policy's aws:RequestTag sees
+// the same one.
+func errRepeatedTagKey(key string) *Error {
+	return errInvalidValue("Tag.Key", key, "The tag key is repeated")
+}
+
+// ErrTagKeyCaseCollision is the error for a tag key that differs only by
+// case from another key of the request or, for TagQueue, of the queue, sent
+// by a principal evaluated against its policies: condition keys match
+// without regard to case, so the two would feed one aws:RequestTag or
+// aws:ResourceTag key. It is errRepeatedTagKey's error, with its reason.
+func ErrTagKeyCaseCollision(key string) *Error {
+	return errInvalidValue("Tag.Key", key,
+		"The tag key differs only by case from another tag key")
+}
+
 // sentinelErrors maps the store's sentinels to the errors they become.
 var sentinelErrors = []struct {
 	err    error
@@ -280,6 +313,14 @@ func ToError(ctx context.Context, err error) *Error {
 			cp := *se.apiErr
 			return &cp
 		}
+	}
+	var denied *authz.Denied
+	if errors.As(err, &denied) {
+		return ErrAccessDenied(denied)
+	}
+	var tagCase *contracts.TagKeyCaseError
+	if errors.As(err, &tagCase) {
+		return ErrTagKeyCaseCollision(tagCase.Key)
 	}
 	var receipt *contracts.ReceiptError
 	if errors.As(err, &receipt) {

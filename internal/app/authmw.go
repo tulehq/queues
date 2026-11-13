@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -9,6 +10,8 @@ import (
 	"tule.dev/identity/keysource"
 	"tule.dev/sigv4"
 
+	"tule.dev/queues/internal/authz"
+	"tule.dev/queues/internal/contracts"
 	"tule.dev/queues/internal/modules/health"
 	"tule.dev/queues/internal/modules/inspect"
 	"tule.dev/queues/internal/sqsapi"
@@ -42,7 +45,8 @@ type verifiers struct {
 // through. They know the configured root key, belonging to the account's
 // root user, and, when an identity endpoint is configured, every key
 // identity issued, asked of identity on each request after the root key.
-// Any key they accept may call every operation: there are no permissions.
+// What a key they accept may do is decided after them: the root key may do
+// everything, and any other is evaluated against its identity policies.
 // Requests are accepted signed for sqs in any region. The path is
 // canonicalized as every service but S3 signs it, since Query requests go
 // to queue URL paths.
@@ -136,4 +140,51 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	sqsapi.WriteError(w, r, sqsapi.ProtocolOf(r), err)
+}
+
+// InspectAction is the action the inspection API needs, which is Tule's,
+// not AWS's: a principal other than the root user may use any route under
+// /_queues/ only when its identity policies allow tule:Inspect on
+// InspectResource.
+const InspectAction = "tule:Inspect"
+
+// InspectResource is the resource tule:Inspect is evaluated on: every queue
+// of the account and region, arn:aws:sqs:<region>:<account>:*, which a
+// policy grants with that ARN, a wider pattern such as arn:aws:sqs:*:*:*,
+// or "*".
+func InspectResource(q *contracts.QueueSettings) string {
+	return q.ARN("*")
+}
+
+// authorizeInspection refuses an inspection request whose principal may not
+// inspect, with AccessDenied in the inspection API's error form. The SQS
+// routes are authorized per operation by the queues module.
+func authorizeInspection(
+	authorizer *authz.Authorizer, q *contracts.QueueSettings,
+) func(http.Handler) http.Handler {
+	resource := InspectResource(q)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.HasPrefix(r.URL.Path, inspect.Prefix) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			p, ok := sigv4.PrincipalFrom(r.Context())
+			if !ok {
+				inspect.WriteError(w, r, errors.New(
+					"authorize inspection: the request carries no verified principal"))
+				return
+			}
+			err := authorizer.Authorize(
+				r,
+				p,
+				authz.Check{Action: InspectAction, Resource: resource},
+			)
+			if err != nil {
+				inspect.WriteError(w, r, err)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

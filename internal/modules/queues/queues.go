@@ -6,8 +6,8 @@ import (
 )
 
 func (m *Module) createQueue(c *call) (any, error) {
-	var req sqsapi.CreateQueueRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.CreateQueueRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	if req.QueueName == nil {
@@ -31,8 +31,8 @@ func (m *Module) createQueue(c *call) (any, error) {
 }
 
 func (m *Module) getQueueURL(c *call) (any, error) {
-	var req sqsapi.GetQueueURLRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.GetQueueURLRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := sqsapi.Required("QueueName", req.QueueName)
@@ -52,8 +52,8 @@ func (m *Module) getQueueURL(c *call) (any, error) {
 // queueOnly decodes a request that takes nothing but a queue, and returns
 // the queue's name.
 func (m *Module) queueOnly(c *call) (string, error) {
-	var req sqsapi.QueueRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.QueueRequest](c)
+	if err != nil {
 		return "", err
 	}
 	return m.queueName(c, req.QueueURL)
@@ -76,8 +76,8 @@ func (m *Module) purgeQueue(c *call) (any, error) {
 }
 
 func (m *Module) listQueues(c *call) (any, error) {
-	var req sqsapi.ListQueuesRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.ListQueuesRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	n, err := sqsapi.CheckMaxResults(req.MaxResults)
@@ -104,8 +104,8 @@ func (m *Module) listQueues(c *call) (any, error) {
 }
 
 func (m *Module) listDeadLetterSourceQueues(c *call) (any, error) {
-	var req sqsapi.ListDeadLetterSourceQueuesRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.ListDeadLetterSourceQueuesRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -131,8 +131,8 @@ func (m *Module) listDeadLetterSourceQueues(c *call) (any, error) {
 }
 
 func (m *Module) getQueueAttributes(c *call) (any, error) {
-	var req sqsapi.GetQueueAttributesRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.GetQueueAttributesRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -151,8 +151,8 @@ func (m *Module) getQueueAttributes(c *call) (any, error) {
 }
 
 func (m *Module) setQueueAttributes(c *call) (any, error) {
-	var req sqsapi.SetQueueAttributesRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.SetQueueAttributesRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -174,8 +174,8 @@ func (m *Module) setQueueAttributes(c *call) (any, error) {
 }
 
 func (m *Module) tagQueue(c *call) (any, error) {
-	var req sqsapi.TagQueueRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.TagQueueRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -192,8 +192,8 @@ func (m *Module) tagQueue(c *call) (any, error) {
 }
 
 func (m *Module) untagQueue(c *call) (any, error) {
-	var req sqsapi.UntagQueueRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.UntagQueueRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
@@ -219,15 +219,15 @@ func (m *Module) listQueueTags(c *call) (any, error) {
 }
 
 func (m *Module) addPermission(c *call) (any, error) {
-	var req sqsapi.AddPermissionRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.AddPermissionRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
 	if err != nil {
 		return nil, err
 	}
-	p, err := sqsapi.CheckPermission(&req)
+	p, err := sqsapi.CheckPermission(req)
 	if err != nil {
 		return nil, err
 	}
@@ -235,8 +235,8 @@ func (m *Module) addPermission(c *call) (any, error) {
 }
 
 func (m *Module) removePermission(c *call) (any, error) {
-	var req sqsapi.RemovePermissionRequest
-	if err := c.decode(&req); err != nil {
+	req, err := decoded[sqsapi.RemovePermissionRequest](c)
+	if err != nil {
 		return nil, err
 	}
 	name, err := m.queueName(c, req.QueueURL)
