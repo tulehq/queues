@@ -10,8 +10,8 @@ It is not a production queue service. Every access key it accepts shares
 the same queues: the configured key, the account's root user's, and, when it
 is pointed at [identity](https://github.com/tulehq/identity), every key
 identity issued. Standalone, the configured key may do everything; with
-identity, every other key may do what its identity policies allow
-([Permissions](#permissions)).
+identity, every other key may do what its identity policies and the queue's
+policy allow ([Permissions](#permissions)).
 
 ## Running it
 
@@ -89,29 +89,82 @@ the inspection API.
 
 With an identity endpoint, the configured key, which is identity's root key
 too, is still never evaluated, as AWS never evaluates the root user. Only the
-configured account's root user is root here: a principal marked root in
-another account is refused like any principal of another account. Every
-other key identity issues, an IAM user's or a role session's, is evaluated on
-every request against its identity policies as identity hands them over (a
-user's inline and attached managed policies, a session's role's), with
-[tule.dev/policy](https://github.com/tulehq/policy): an explicit `Deny` wins,
-otherwise the request needs an `Allow`. A request no policy allows fails with
-`403` `AccessDenied`, the code SQS sends in Query and in the JSON protocol's
-`x-amzn-query-error` header (the JSON `__type` is `AccessDenied` too), with
-IAM's message:
+configured account's root user is root here. Every other key identity issues,
+an IAM user's, a role session's, or the root user of another account, is
+evaluated on every request against its identity policies as identity hands
+them over (a user's inline and attached managed policies, a session's
+role's) and the queue's policy, its `Policy` attribute, together, with
+[tule.dev/policy](https://github.com/tulehq/policy)'s `Authorize`, as the
+IAM User Guide's "Policy evaluation logic" and "Cross-account policy
+evaluation logic" describe:
+
+- An explicit `Deny` in either kind of policy denies.
+- **Within the configured account**, an `Allow` in either allows. A queue
+  policy that names the IAM user, the role (by its ARN, path included, which
+  grants its sessions), the session, or `"*"`, is enough on its own; one
+  that names only the account (`"000000000000"` or
+  `arn:aws:iam::000000000000:root`) delegates to the account and also needs
+  an identity `Allow`.
+- **Across accounts**, a principal of another account needs both an
+  identity `Allow` in its own account and a queue policy `Allow`, through
+  its account or directly. Another account's root user has every identity
+  permission in its own account, so it needs only the queue policy.
+- `AddPermission`, `CreateQueue`, `DeleteQueue`, `ListQueues`,
+  `ListQueueTags`, `RemovePermission`, `SetQueueAttributes`, `TagQueue` and
+  `UntagQueue` are never shared across accounts: "Cross-account
+  permissions don't apply to the following actions" (SQS Developer Guide,
+  "Basic examples of Amazon SQS policies", and each one's API reference). A
+  principal of another account is evaluated on them without the queue's
+  policy, so nothing grants them to it.
+
+A request no policy allows fails with `403` `AccessDenied`, the code SQS
+sends in Query and in the JSON protocol's `x-amzn-query-error` header (the
+JSON `__type` is `AccessDenied` too), with IAM's message, which names the
+policy type that decided:
 
 ```
 User: arn:aws:iam::000000000000:user/dev is not authorized to perform: sqs:sendmessage on resource: arn:aws:sqs:us-east-1:000000000000:orders because no identity-based policy allows the sqs:sendmessage action
 ```
 
-or `... with an explicit deny in an identity-based policy`. The action is in
-lower case, as SQS writes it in its denials. A denied request does nothing;
-it is checked before the queue is looked up, so a queue that does not exist
-is denied too.
+The endings are tule.dev/policy's `Reason`:
+
+| Reason | Ending |
+|---|---|
+| `IdentityDeny` | `with an explicit deny in an identity-based policy` |
+| `ResourceDeny` | `with an explicit deny in a resource-based policy` |
+| `NoIdentityAllow` | `because no identity-based policy allows the <action> action` |
+| `NoResourceAllow` | `because no resource-based policy allows the <action> action` |
+
+When both kinds deny, the identity-based one is named: AWS names "only one
+of those policy types" without saying which (IAM User Guide, "Troubleshoot
+access denied error messages"). A request that needs an `Allow` of each
+kind and has neither is reported for the identity-based type. The action is in lower case, as SQS writes it in its
+denials. A denied request does nothing; it is checked before the queue is
+looked up, so a queue that does not exist is denied too.
 
 **Breaking change in v0.2.0.** A key identity issued that has no policy
 allowing an operation could call it before and is denied now. Give each
 user or role the policy it needs, such as `sqs:*` on `*`.
+
+**Changes in v0.3.0.** Queue policies are enforced.
+
+- A queue's `Policy` now grants and denies: a `Deny` in it refuses a
+  request the caller's identity policies allow, and a grant naming a user
+  or role of the account allows a request its identity policies do not.
+- Principals of another account, refused everything in v0.2.0, may now
+  call what a queue policy grants them, as above.
+- `Policy` is checked when it is set ([Queue policies](#queue-policies)).
+  A queue already holding a `Policy` that does not pass, which v0.2.0
+  stored without checking, is not evaluated: every evaluated request on it
+  fails with `500` `InternalFailure`, logged, until the root key sets a
+  valid one or removes it. The root key is unaffected.
+- identity v0.4.0 or later is needed: queues asks identity's signing-key
+  endpoint for version 3, the principal's attributes. An older identity
+  fails every evaluated request with `500` `InternalFailure`.
+- `aws:PrincipalArn` for a role session is its role's ARN with the role's
+  path, `aws:userid` is supplied for every principal, and
+  `aws:PrincipalTag/<key>` is supplied, so a condition on any of them now
+  matches as in AWS.
 
 Each operation is evaluated as the action and resource the SQS Service
 Authorization Reference gives it (the table is `operationAccess` in
@@ -135,8 +188,12 @@ The condition keys supplied are `aws:SourceIp` (the connection's address),
 `aws:CurrentTime`, `aws:EpochTime`, `aws:SecureTransport`,
 `aws:RequestedRegion` (the configured region, as an endpoint fixes it in
 AWS, not the region the request was signed for, since any region verifies
-here), `aws:PrincipalAccount`, `aws:PrincipalArn`,
-`aws:PrincipalType`, `aws:username` for an IAM user, and, from the
+here), the principal's keys from the attributes identity hands over
+(`aws:PrincipalAccount`, `aws:PrincipalArn`, for a role session its role's
+ARN with the role's path, `aws:userid`, `aws:PrincipalType`, and
+`aws:username` for an IAM user; a request cannot set them),
+`aws:PrincipalTag/<key>` for each of the IAM user's tags or the session's
+role's tags (identity issues no session tags), and, from the
 reference's keys for SQS: `aws:ResourceTag/<key>` from the queue's tags,
 `aws:RequestTag/<key>` and `aws:TagKeys` for `CreateQueue` and `TagQueue`,
 and `aws:TagKeys` for `UntagQueue`. They fill policy variables such as
@@ -150,12 +207,14 @@ queue URL), so no ARN is longer than the 80-character name allows, and a
 tag key or value past 128 or 256 characters fails `InvalidParameterValue`.
 
 A request is decoded once, and the operation acts on the decoding that was
-evaluated. The queue an operation acts on is the queue it was evaluated on. Its tags are
-read, with its store ID, before the evaluation, and the operation runs pinned
-to that ID: a queue deleted and created again under the same name in
-between, or created where none existed, is answered `QueueDoesNotExist`
-rather than acted on. A tag changed in between is not noticed; the request
-is evaluated on the tags as they were read.
+evaluated. The queue an operation acts on is the queue it was evaluated on. Its tags and
+its `Policy` are read, with its store ID, in one transaction before the
+evaluation, and the operation runs pinned to that ID: a queue deleted and
+created again under the same name in between, or created where none
+existed, is answered `QueueDoesNotExist` rather than acted on, so the
+policy evaluated is the one stored for the queue acted on. A tag or the
+policy changed in between is not noticed; the request is evaluated on them
+as they were read.
 
 Condition keys match without regard to case, so tag keys that differ only by
 case (`env`, `ENV`) would feed one `aws:RequestTag/env` or
@@ -168,38 +227,94 @@ request on it fails with `500` `InternalFailure`, logged, until the root key
 removes one.
 
 The [inspection API](#inspection-api) is not AWS's, and needs `tule:Inspect`,
-an action of Tule's own, on `arn:aws:sqs:<region>:<account>:*`: a policy
-grants it with that ARN, a wider pattern such as `arn:aws:sqs:*:*:*`, or
-`*`. The configured key needs nothing.
+an action of Tule's own, on `arn:aws:sqs:<region>:<account>:*`: an
+identity policy grants it with that ARN, a wider pattern such as
+`arn:aws:sqs:*:*:*`, or `*`. No queue policy applies to it, so a principal
+of another account is always refused it. The configured key needs
+nothing.
+
+A principal identity hands over in a state it never produces is not
+evaluated, and its request fails with `500` `InternalFailure`, logged:
+`Root` set on a principal whose type is not `Account`, or an `Account`
+principal without `Root` (this service skips evaluation on the first,
+tule.dev/policy grants full identity access on the second, so the two must
+agree), or two tags whose keys differ only by case.
 
 Gaps:
 
-- **Queue policies are stored, not enforced.** `Policy`, and what
-  `AddPermission` writes into it, grant and refuse nothing. Only identity
-  policies are evaluated; there are no permissions boundaries, session
-  policies or SCPs.
-- **Cross-account access is refused.** The queues are the configured
-  account's. A principal of another account, such as a member account's
-  `OrganizationAccountAccessRole` session, is evaluated on its identity
-  policies first (an explicit deny or a missing allow is reported as such),
-  and when they allow the request it is still denied, "... because no
-  resource-based policy allows the \<action\> action": AWS grants a
-  cross-account request only when the queue's policy allows it too ("Troubleshoot an access denied
-  error in Amazon SQS", SQS Developer Guide), and queue policies are not
-  enforced yet. Allowing it on identity policies alone would let a member
-  account's administrator reach the management account's queues. The
-  inspection API is refused the same way.
-- **A role session's `aws:PrincipalArn` has no path.** It is its role's ARN
-  without the role's path (`arn:aws:iam::<account>:role/<name>`), which the
-  session ARN does not carry and identity does not hand over yet. A policy
-  condition on a role ARN that includes a path, such as `ArnLike` on
-  `arn:aws:iam::*:role/restricted/*`, does not match a session, so a
-  `Deny` written that way does not apply to sessions yet; AWS's value has
-  the path. `aws:PrincipalTag/<key>` is not supplied, nor `aws:userid` but
-  for the root user.
+- **Permissions boundaries, session policies, SCPs and RCPs** are not
+  evaluated; where AWS lets them limit a queue policy's grant to a role, the
+  grant here is unlimited.
+- **Stored principals are matched by ARN.** AWS turns a user or role ARN in
+  a stored resource-based policy into the principal's unique ID, so a
+  principal deleted and created again under the same name does not inherit
+  the grant. Here it does, until identity can resolve unique IDs for the
+  services. A session whose role was deleted is refused everything.
+- **`aws:PrincipalOrgID` and `aws:PrincipalOrgPaths` are not supplied**:
+  identity does not carry the organization. A positive condition on them
+  never holds, and a negated one (`StringNotEquals` and the like) always
+  does, so a `Deny` written with a negated operator on them, such as the
+  common "deny anyone outside my organization", denies every evaluated
+  principal.
+- **Service principals never match.** No Tule caller is a service, so a
+  statement naming `sqs.amazonaws.com` or `sns.amazonaws.com` grants
+  nothing.
 - **Event source mappings poll with the credentials functions supplies.**
   The configured key keeps working unchanged; a role's session needs the SQS permissions AWS documents for mappings
-  (`sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`).
+  (`sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`),
+  from its identity policies, and from the queue's policy too when the
+  role is another account's.
+
+### Queue policies
+
+A queue's policy is its `Policy` attribute, set with `CreateQueue` and
+`SetQueueAttributes` and read with `GetQueueAttributes`, and written one
+statement at a time by `AddPermission` and `RemovePermission`. It is stored
+and returned as it was sent.
+
+`CreateQueue` and `SetQueueAttributes` refuse, with `InvalidAttributeValue`
+("Invalid value for the parameter Policy. Reason: ..."), the error SQS
+documents for "an incorrect policy or a principal" ("Troubleshoot Amazon
+SQS API errors"), a `Policy` that:
+
+- is over a quota of "Amazon SQS policy quotas" (SQS Developer Guide):
+  8,192 bytes, 20 statements, 7 actions in a statement, 50 principals or 10
+  conditions. How SQS counts principals and conditions is not documented;
+  here they are counted across the policy, `"*"` being one principal and
+  each key under each operator one condition;
+- is not a resource-based policy tule.dev/policy's `ParseResource`
+  accepts: valid JSON in the IAM policy grammar, each statement with a
+  `Principal` or `NotPrincipal` and a `Resource` or `NotResource`, `AWS`
+  principals that are `"*"`, an account ID, or a user, role, session or
+  root ARN or unique ID (a group, a partial wildcard or a `Federated`
+  principal is refused), unique `Sid`s of any characters. The reason is
+  the parser's message; SQS's wording is not documented.
+
+SQS also refuses a principal ARN that names no existing IAM entity; this
+service does not ask identity, so such a policy is stored and its
+statement matches nobody until the entity exists.
+
+`AddPermission` adds an `Allow` statement whose `Sid` is the label, whose
+`Principal` is `{"AWS": [...]}` with `arn:aws:iam::<id>:root` for each of
+`AWSAccountIds`, whose `Action` is `SQS:<name>` for each of `Actions`, and
+whose `Resource` is the queue's ARN. A queue without a policy gets one with
+`Version` `2012-10-17` and `Id` `<queue ARN>/SQSDefaultPolicy`; a policy
+already set keeps its `Version`, `Id` and statements, and the new statement
+is appended. The SQS documentation does not show the generated statement,
+so this shape is not checked against AWS beyond what the API reference
+says. The request is checked as the API reference has it: `Label` of 1 to
+80 letters, digits, hyphens and underscores, unique in the policy (a label
+in use is `InvalidParameterValue`); `AWSAccountIds` of 12 digits, since
+"`AddPermission` does not support adding a non-account principal"; at
+least one `Actions` value, each `*` or an SQS action name, and at most 7,
+else `OverLimit` ("An Amazon SQS policy can have a maximum of seven
+actions per statement"). A statement that would put the policy over a
+quota is `OverLimit` too ("AddPermission returns this error if the maximum
+number of permissions for the queue is reached").
+
+`RemovePermission` removes the statement whose `Sid` is the label, and
+fails with `InvalidParameterValue` when the policy has none. Removing the
+last statement removes the `Policy`.
 
 ## Health checks
 
@@ -298,11 +413,11 @@ one-item forms without an index that the API reference's examples show
 | `GetQueueUrl` | |
 | `ListQueues` | `QueueNamePrefix`, `MaxResults` 1 to 1000, and `NextToken` only when `MaxResults` is set; without it, up to 1000 URLs |
 | `GetQueueAttributes` | `All` or named attributes, the approximate counts included |
-| `SetQueueAttributes` | Every settable attribute; an empty `Policy`, `RedrivePolicy`, `RedriveAllowPolicy` or `KmsMasterKeyId` removes it |
+| `SetQueueAttributes` | Every settable attribute; an empty `Policy`, `RedrivePolicy`, `RedriveAllowPolicy` or `KmsMasterKeyId` removes it. `Policy` is checked ([Queue policies](#queue-policies)) |
 | `PurgeQueue` | Deletes every message, in flight or not, at once |
 | `TagQueue` / `UntagQueue` / `ListQueueTags` | |
 | `ListDeadLetterSourceQueues` | Paginated as `ListQueues` |
-| `AddPermission` / `RemovePermission` | Write and remove a statement in the queue's `Policy`, as SQS generates one; see the differences |
+| `AddPermission` / `RemovePermission` | Write and remove a statement in the queue's `Policy` ([Queue policies](#queue-policies)) |
 | `SendMessage` / `SendMessageBatch` | Delays, message attributes of every type, `AWSTraceHeader`, FIFO groups and deduplication; batches report each entry |
 | `ReceiveMessage` | `MaxNumberOfMessages`, `VisibilityTimeout`, `WaitTimeSeconds` long polling, `MessageAttributeNames` (`All`, `.*`, `prefix.*`), `MessageSystemAttributeNames` and the deprecated `AttributeNames`, `ReceiveRequestAttemptId` on FIFO queues |
 | `DeleteMessage` / `DeleteMessageBatch` | |
@@ -437,14 +552,12 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
 
 ## Differences from AWS
 
-- **Only identity policies are enforced, on the same queues.** Every
-  accepted key sees the same queues; what it may do is decided by its
-  identity policies alone ([Permissions](#permissions)). `Policy` is
-  kept and reported but enforces nothing. `AddPermission` writes a
-  statement into `Policy` with the label as its `Sid`, as SQS generates
-  one, and fails with `InvalidParameterValue` for a label in use;
-  `RemovePermission` removes it, and fails the same way for a label the
-  policy does not have. Neither grants anything.
+- **The queues are the configured account's.** What a key may do is
+  decided by its identity policies and the queue's policy
+  ([Permissions](#permissions)). A principal of another account has no
+  queues of its own here: it cannot create one (`CreateQueue` is not
+  shared across accounts), and reaches this account's queues as far as
+  their policies let it.
 - **One account and one region.** The configured ones. A queue URL of
   another account, and `GetQueueUrl` with another
   `QueueOwnerAWSAccountId`, fail with `QueueDoesNotExist`, before the
@@ -601,7 +714,7 @@ test, and, for role sessions, a real accounts service that identity's
 `AssumeRole` asks about member accounts. The checkouts are the siblings
 `../identity` and `../accounts` by default, or the directories
 `TULE_E2E_IDENTITY_DIR` and `TULE_E2E_ACCOUNTS_DIR` name; CI checks out
-`tulehq/identity` v0.2.0 and `tulehq/accounts` v0.2.0 and sets them.
+`tulehq/identity` v0.4.0 and `tulehq/accounts` v0.2.0 and sets them.
 Without a checkout those tests fail rather than being skipped.
 
 ## License
