@@ -482,3 +482,86 @@ func TestAnUnsharedActionIsNeverGrantedAcrossAccounts(t *testing.T) {
 		t.Fatalf("a principal of the account: %v", err)
 	}
 }
+
+const (
+	orgID   = "o-a1b2c3d4e5"
+	orgPath = "o-a1b2c3d4e5/r-ab12/ou-ab12-11111111/"
+)
+
+func TestTheOrganizationKeysComeFromThePrincipal(t *testing.T) {
+	a := newAuthorizer()
+	send := Check{Action: "sqs:SendMessage", Resource: queueARN}
+	byID := condition("StringEquals", "aws:PrincipalOrgID", orgID)
+	byPath := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sqs:SendMessage",
+		"Resource":"*","Condition":{"ForAnyValue:StringLike":
+		{"aws:PrincipalOrgPaths":"o-a1b2c3d4e5/r-ab12/ou-ab12-11111111/*"}}}]}`
+	for name, doc := range map[string]string{"OrgID": byID, "OrgPaths": byPath} {
+		p := principal(userARN, doc)
+		p.OrgID, p.OrgPaths = orgID, []string{orgPath}
+		if err := authorize(t, a, p, send); err != nil {
+			t.Errorf("a member on %s: %v", name, err)
+		}
+		// An account in no organization has neither key.
+		requireDenied(t, authorize(t, a, principal(userARN, doc), send),
+			"sqs:SendMessage", queueARN, policy.NoIdentityAllow)
+	}
+}
+
+// outsideOrgDeny allows sqs:SendMessage and denies it to every principal
+// outside the organization: the negated condition an absent key satisfies.
+const outsideOrgDeny = `{"Version":"2012-10-17","Statement":[
+	{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"*"},
+	{"Effect":"Deny","Action":"sqs:SendMessage","Resource":"*",
+	 "Condition":{"StringNotEquals":{"aws:PrincipalOrgID":"o-a1b2c3d4e5"}}}]}`
+
+func TestAnUnknownOrganizationIsPassedAsUnknown(t *testing.T) {
+	a := newAuthorizer()
+	send := Check{Action: "sqs:SendMessage", Resource: queueARN}
+
+	p := principal(userARN, outsideOrgDeny)
+	if got := Unknown(p); got != nil {
+		t.Fatalf("Unknown of a known organization = %v, want none", got)
+	}
+	p.OrgUnknown = true
+	if got := Unknown(p); !slices.Equal(got,
+		[]string{"aws:PrincipalOrgID", "aws:PrincipalOrgPaths"}) {
+		t.Fatalf("Unknown = %v, want both organization keys", got)
+	}
+	// Absent, the negated Deny would apply to the member as to an outsider;
+	// unknown, a Deny whose condition might hold applies. Either way it is
+	// not lapsed.
+	requireDenied(t, authorize(t, a, p, send), "sqs:SendMessage", queueARN,
+		policy.IdentityDeny)
+
+	// A positive grant on an unknown key never holds.
+	grant := principal(userARN, condition("StringEquals", "aws:PrincipalOrgID", orgID))
+	grant.OrgUnknown = true
+	requireDenied(t, authorize(t, a, grant, send), "sqs:SendMessage", queueARN,
+		policy.NoIdentityAllow)
+
+	// A member's key is known, so the Deny does not apply to it.
+	member := principal(userARN, outsideOrgDeny)
+	member.OrgID, member.OrgPaths = orgID, []string{orgPath}
+	if err := authorize(t, a, member, send); err != nil {
+		t.Fatalf("a member under the outside-organization Deny: %v", err)
+	}
+}
+
+func TestAnUnknownOrganizationReachesTheQueuePolicy(t *testing.T) {
+	a := newAuthorizer()
+	pol, err := a.ResourcePolicy(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+		"Principal":"*","Action":"sqs:SendMessage","Resource":"` + queueARN + `",
+		"Condition":{"StringEquals":{"aws:PrincipalOrgID":"` + orgID + `"}}}]}`)
+	if err != nil {
+		t.Fatalf("queue policy: %v", err)
+	}
+	send := Check{Action: "sqs:SendMessage", Resource: queueARN, Policy: pol}
+	p := memberPrincipal(allow("sqs:SendMessage", "*"))
+	p.OrgID, p.OrgPaths = orgID, []string{orgPath}
+	if err = authorize(t, a, p, send); err != nil {
+		t.Fatalf("a member of the organization: %v", err)
+	}
+	p.OrgID, p.OrgPaths, p.OrgUnknown = "", nil, true
+	requireDenied(t, authorize(t, a, p, send), "sqs:SendMessage", queueARN,
+		policy.NoResourceAllow)
+}

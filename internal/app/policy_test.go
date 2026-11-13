@@ -27,7 +27,7 @@ import (
 const policyUserARN = "arn:aws:iam::000000000000:user/dev"
 
 // policyIdentity stands in for identity's signing-key endpoint at version
-// 3: every key is a user of the default account with secret "test" and the
+// 4, for a principal in no organization: every key is a user of the default account with secret "test" and the
 // given identity policies.
 func policyIdentity(t *testing.T, policies ...string) string {
 	t.Helper()
@@ -76,7 +76,7 @@ func policyIdentityIn(t *testing.T, account, arn string, policies ...string) str
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"Principal":  principal,
 			"SigningKey": base64.StdEncoding.EncodeToString(key),
-			"Version":    3,
+			"Version":    4,
 		})
 	}))
 	t.Cleanup(srv.Close)

@@ -13,6 +13,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -183,7 +184,7 @@ func (a *Authorizer) check(
 	}
 	az := policy.Authorize(policy.AuthorizeRequest{
 		Action: c.Action, Resource: c.Resource, ResourceAccount: a.account,
-		Caller: Caller(p), Context: ctx,
+		Caller: Caller(p), Context: ctx, Unknown: Unknown(p),
 	}, c.Policy, pols...)
 	if az.Decision == policy.Allow && c.Unshared && p.AccountID != a.account {
 		// Only an Allow is replaced: an explicit Deny keeps its message.
@@ -306,13 +307,35 @@ func (a *Authorizer) parse(kind policyKind, doc []byte) (*policy.Policy, error) 
 	return pol, nil
 }
 
+// The organization keys, which identity supplies at signing-key version 4.
+const (
+	keyPrincipalOrgID    = "aws:PrincipalOrgID"
+	keyPrincipalOrgPaths = "aws:PrincipalOrgPaths"
+)
+
+// Unknown returns the condition keys whose values are not known for p: the
+// organization keys when identity could not tell p's organization
+// (OrgUnknown), else none. They are passed as unknown, never left absent,
+// since an absent key satisfies a negated operator: StringNotEquals on
+// aws:PrincipalOrgID would grant, or let a Deny lapse, for a principal
+// whose organization is not known.
+func Unknown(p sigv4.Principal) []string {
+	if p.OrgUnknown {
+		return []string{keyPrincipalOrgID, keyPrincipalOrgPaths}
+	}
+	return nil
+}
+
 // Context returns the global condition keys of r by p: aws:SourceIp (the
 // connection's address; nothing in front of the service is trusted),
 // aws:CurrentTime and aws:EpochTime, aws:SecureTransport,
 // aws:RequestedRegion (the service's region: AWS's endpoint fixes it,
 // while here a request signed for any region verifies, so the credential
-// scope's region is the caller's choice), and aws:PrincipalTag/<key> for
-// each of p's tags (an IAM user's, or a session's role's).
+// scope's region is the caller's choice), aws:PrincipalTag/<key> for
+// each of p's tags (an IAM user's, or a session's role's), and
+// aws:PrincipalOrgID and aws:PrincipalOrgPaths when p's account is in the
+// organization (left out otherwise, as AWS leaves them out, and named by
+// Unknown when identity could not tell).
 //
 // The principal's own keys, aws:PrincipalArn (a role session's role ARN
 // with its path), aws:PrincipalAccount, aws:userid, aws:PrincipalType and
@@ -333,6 +356,10 @@ func (a *Authorizer) Context(r *http.Request, p sigv4.Principal) map[string][]st
 	// at most 50, so they feed distinct aws:PrincipalTag keys.
 	for k, v := range p.Tags {
 		ctx["aws:PrincipalTag/"+k] = []string{v}
+	}
+	if p.OrgID != "" {
+		ctx[keyPrincipalOrgID] = []string{p.OrgID}
+		ctx[keyPrincipalOrgPaths] = slices.Clone(p.OrgPaths)
 	}
 	return ctx
 }
