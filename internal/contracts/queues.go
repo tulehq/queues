@@ -203,6 +203,16 @@ type Permission struct {
 	Actions    []string
 }
 
+// QueueAccess is what authorizing a request on a queue reads of it, read
+// together: the ID the request is pinned to (WithQueuePin), the tags for
+// aws:ResourceTag/<key>, and the queue's Policy attribute, "" when it has
+// none, so the policy evaluated is the one of the queue acted on.
+type QueueAccess struct {
+	Tags   map[string]string
+	Policy string
+	ID     QueueID
+}
+
 // MessageFilter narrows an inspection listing.
 type MessageFilter struct {
 	State string
@@ -239,8 +249,9 @@ type QueueProvider interface {
 	TagQueue(ctx context.Context, name string, tags map[string]string) error
 	UntagQueue(ctx context.Context, name string, keys []string) error
 	ListQueueTags(ctx context.Context, name string) (map[string]string, error)
-	// QueueTags returns the queue's ID and tags, read together.
-	QueueTags(ctx context.Context, name string) (QueueID, map[string]string, error)
+	// QueueAccess returns what authorizing a request on the queue reads
+	// of it, read together.
+	QueueAccess(ctx context.Context, name string) (*QueueAccess, error)
 	// ListDeadLetterSourceQueues lists the names of the queues whose
 	// RedrivePolicy targets the queue.
 	ListDeadLetterSourceQueues(ctx context.Context, name string,

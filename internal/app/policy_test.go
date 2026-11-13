@@ -27,16 +27,28 @@ import (
 const policyUserARN = "arn:aws:iam::000000000000:user/dev"
 
 // policyIdentity stands in for identity's signing-key endpoint at version
-// 2: every key is a user of the default account with secret "test" and the
+// 3: every key is a user of the default account with secret "test" and the
 // given identity policies.
 func policyIdentity(t *testing.T, policies ...string) string {
 	t.Helper()
 	return policyIdentityIn(t, "000000000000", policyUserARN, policies...)
 }
 
-// policyIdentityIn is policyIdentity for the principal arn of account.
+// policyIdentityIn is policyIdentity for the principal arn of account, an
+// IAM user or a role session, whose role is at path /.
 func policyIdentityIn(t *testing.T, account, arn string, policies ...string) string {
 	t.Helper()
+	attrs := map[string]any{
+		"PrincipalType": "User", "PrincipalArn": arn, "UserId": "AIDAEXAMPLEUSERID01",
+	}
+	if strings.Contains(arn, ":assumed-role/") {
+		parts := strings.Split(arn, "/")
+		attrs = map[string]any{
+			"PrincipalType": "AssumedRole",
+			"PrincipalArn":  "arn:aws:iam::" + account + ":role/" + parts[1],
+			"UserId":        "AROAEXAMPLEROLEID01:" + parts[2],
+		}
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			AccessKeyID string `json:"AccessKeyId"`
@@ -54,13 +66,17 @@ func policyIdentityIn(t *testing.T, account, arn string, policies ...string) str
 		}
 		key := sigv4.DeriveSigningKey("test", req.Date, req.Region, req.Service)
 		w.Header().Set("Content-Type", "application/json")
+		principal := map[string]any{
+			"AccountId": account, "Arn": arn,
+			"AccessKeyId": req.AccessKeyID, "Policies": docs,
+		}
+		for k, v := range attrs {
+			principal[k] = v
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"Principal": map[string]any{
-				"AccountId": account, "Arn": arn,
-				"AccessKeyId": req.AccessKeyID, "Policies": docs,
-			},
+			"Principal":  principal,
 			"SigningKey": base64.StdEncoding.EncodeToString(key),
-			"Version":    2,
+			"Version":    3,
 		})
 	}))
 	t.Cleanup(srv.Close)

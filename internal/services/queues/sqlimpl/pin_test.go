@@ -14,10 +14,11 @@ func TestAPinnedQueueIsTheEvaluatedOne(t *testing.T) {
 	if err := s.TagQueue(t.Context(), "orders", map[string]string{"team": "blue"}); err != nil {
 		t.Fatalf("tag: %v", err)
 	}
-	id, tags, err := s.QueueTags(t.Context(), "orders")
-	if err != nil || tags["team"] != "blue" || id == 0 {
-		t.Fatalf("QueueTags = %d, %v, %v", id, tags, err)
+	a, err := s.QueueAccess(t.Context(), "orders")
+	if err != nil || a.Tags["team"] != "blue" || a.ID == 0 {
+		t.Fatalf("QueueAccess = %+v, %v", a, err)
 	}
+	id := a.ID
 	pinned := contracts.WithQueuePin(t.Context(), "orders", id)
 	if _, err = s.QueueInfo(pinned, "orders"); err != nil {
 		t.Fatalf("the pinned queue itself: %v", err)
@@ -63,11 +64,11 @@ func recreate(t *testing.T, s *Service, clk *clock, name string) {
 func TestAPinMatchesOnlyItsQueueName(t *testing.T) {
 	s, _ := newStore(t)
 	createQueue(t, s, "orders", false, nil)
-	id, _, err := s.QueueTags(t.Context(), "orders")
+	a, err := s.QueueAccess(t.Context(), "orders")
 	if err != nil {
-		t.Fatalf("QueueTags: %v", err)
+		t.Fatalf("QueueAccess: %v", err)
 	}
-	pinned := contracts.WithQueuePin(t.Context(), "orders", id)
+	pinned := contracts.WithQueuePin(t.Context(), "orders", a.ID)
 
 	// A pin of a queue that did not exist keeps it not found.
 	absent := contracts.WithQueuePin(t.Context(), "orders", 0)
@@ -84,11 +85,11 @@ func TestAPinMatchesOnlyItsQueueName(t *testing.T) {
 func TestAPinnedTagQueueRefusesKeysDifferingOnlyByCase(t *testing.T) {
 	s, _ := newStore(t)
 	createQueue(t, s, "orders", false, nil)
-	id, _, err := s.QueueTags(t.Context(), "orders")
+	a, err := s.QueueAccess(t.Context(), "orders")
 	if err != nil {
-		t.Fatalf("QueueTags: %v", err)
+		t.Fatalf("QueueAccess: %v", err)
 	}
-	pinned := contracts.WithQueuePin(t.Context(), "orders", id)
+	pinned := contracts.WithQueuePin(t.Context(), "orders", a.ID)
 
 	// Two evaluated requests that each passed authorization's check, with
 	// the queue untagged: the second is refused in its own transaction.

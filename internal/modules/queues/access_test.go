@@ -105,3 +105,22 @@ func TestEveryEntryIsTheReferencesAction(t *testing.T) {
 		}
 	}
 }
+
+func TestTheOwnerOnlyOperationsAreRouted(t *testing.T) {
+	// SQS Developer Guide, "Basic examples of Amazon SQS policies",
+	// Example 4: the routed operations cross-account permissions don't
+	// apply to. CancelMessageMoveTask, ListMessageMoveTasks and
+	// StartMessageMoveTask are on that list but not served.
+	want := []string{
+		"AddPermission", "CreateQueue", "DeleteQueue", "ListQueues", "ListQueueTags",
+		"RemovePermission", "SetQueueAttributes", "TagQueue", "UntagQueue",
+	}
+	if len(ownerOnly) != len(want) {
+		t.Fatalf("ownerOnly has %d operations, want %d", len(ownerOnly), len(want))
+	}
+	for _, op := range want {
+		if _, routed := operationAccess[op]; !ownerOnly[op] || !routed {
+			t.Errorf("%s: owner only %t, routed %t", op, ownerOnly[op], routed)
+		}
+	}
+}

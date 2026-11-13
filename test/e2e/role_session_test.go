@@ -66,7 +66,9 @@ func TestIdentityRoleSession(t *testing.T) {
 		// The session verifies, and its role's AdministratorAccess allows
 		// everything, but it is the member account's and the queues are the
 		// management account's: AWS needs a resource-based policy to grant
-		// a cross-account request, and queue policies are not enforced.
+		// a cross-account request, and no queue policy grants this one
+		// (CreateQueue is never shared across accounts). TestQueuePolicies
+		// has the requests a queue policy grants.
 		requireMatch(t, regexp.MustCompile(`^ASIA`), session.AccessKeyID, "session key ID")
 		sessionARN := "arn:aws:sts::" + member + ":assumed-role/" + organizationRole + "/e2e"
 		c := sqsClientWith(srv, session)

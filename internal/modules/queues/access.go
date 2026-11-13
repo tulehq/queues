@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"tule.dev/policy"
 	"tule.dev/sigv4"
 
 	"tule.dev/queues/internal/authz"
@@ -90,6 +91,18 @@ var operationAccess = map[string]access{
 	"UntagQueue": {action: "sqs:UntagQueue", target: untagQueueTarget},
 }
 
+// ownerOnly are the operations "Cross-account permissions don't apply to"
+// (SQS Developer Guide, "Basic examples of Amazon SQS policies", Example
+// 4, and each operation's API reference): a queue policy grants them to
+// principals of the queue's own account only. A principal of another
+// account is evaluated on them without the queue's policy, so nothing
+// grants it them.
+var ownerOnly = map[string]bool{
+	"AddPermission": true, "CreateQueue": true, "DeleteQueue": true, "ListQueues": true,
+	"ListQueueTags": true, "RemovePermission": true, "SetQueueAttributes": true,
+	"TagQueue": true, "UntagQueue": true,
+}
+
 // tagQueueAction is the action CreateQueue also needs when it tags the
 // queue it creates: "To be able to tag a queue on creation, you must have
 // the sqs:CreateQueue and sqs:TagQueue permissions" (SQS API Reference,
@@ -125,11 +138,11 @@ type accessTarget struct {
 }
 
 // authorize checks the request against its principal's identity policies
-// before the operation runs. A root principal is not evaluated, and its
-// request is not read here. A request is decoded once, as its operation's
-// own type (decoded), and the operation acts on that same decoding, so a
-// missing or malformed queue URL fails as the operation would fail and the
-// values evaluated are the values acted on.
+// and the queue's policy before the operation runs. A root principal is
+// not evaluated, and its request is not read here. A request is decoded
+// once, as its operation's own type (decoded), and the operation acts on
+// that same decoding, so a missing or malformed queue URL fails as the
+// operation would fail and the values evaluated are the values acted on.
 func (m *Module) authorize(c *call) error {
 	p, ok := sigv4.PrincipalFrom(c.Request().Context())
 	if !ok {
@@ -155,18 +168,23 @@ func (m *Module) authorize(c *call) error {
 		resource = m.settings.ARN(t.queue)
 	}
 	ctx := t.context
+	var doc string
 	// The tags are read whatever the policies say: deciding from a
 	// policy's bytes whether it asks for them would differ from the parser,
 	// which reads escaped key names.
 	if t.exists {
-		if ctx, err = m.withResourceTags(c, t, ctx); err != nil {
+		if ctx, doc, err = m.readQueue(c, t, ctx); err != nil {
 			return err
 		}
 	}
-	checks := []authz.Check{{Action: a.action, Resource: resource, Context: ctx}}
+	pol, err := m.queuePolicy(c.op, p, t.queue, doc)
+	if err != nil {
+		return err
+	}
+	checks := []authz.Check{{Action: a.action, Resource: resource, Context: ctx, Policy: pol}}
 	if t.alsoTag {
 		checks = append(checks, authz.Check{
-			Action: tagQueueAction, Resource: resource, Context: ctx,
+			Action: tagQueueAction, Resource: resource, Context: ctx, Policy: pol,
 		})
 	}
 	return m.authorizer.Authorize(
@@ -175,55 +193,74 @@ func (m *Module) authorize(c *call) error {
 		checks...) //nolint:wrapcheck // an *authz.Denied, or a fault ToError logs
 }
 
-// withResourceTags adds aws:ResourceTag/<key> for each of the queue's tags
-// to ctx. A queue that does not exist has none; the operation then fails
-// as it would have, once allowed.
+// queuePolicy parses the queue's stored Policy, doc, for an evaluation of
+// op by p: none for a principal of another account on an owner-only
+// operation. A stored policy that cannot be evaluated fails the request
+// (fail closed).
+func (m *Module) queuePolicy(
+	op string, p sigv4.Principal, queue, doc string,
+) (*policy.Policy, error) {
+	if ownerOnly[op] && p.AccountID != m.settings.AccountID {
+		return nil, nil
+	}
+	pol, err := m.authorizer.ResourcePolicy(doc)
+	if err != nil {
+		return nil, fmt.Errorf("authorize: queue %s: %w", queue, err)
+	}
+	return pol, nil
+}
+
+// readQueue adds aws:ResourceTag/<key> for each of the queue's tags to
+// ctx, and returns the queue's Policy, both read together with the queue's
+// ID. A queue that does not exist has neither; the operation then fails as
+// it would have, once allowed.
 //
 // It pins the call to the queue it read (contracts.WithQueuePin), so the
 // operation acts on that queue or, when it was deleted and created again
 // under its name since, fails with QueueDoesNotExist; a queue that did not
-// exist stays not found. A tag changed between this read and the operation
-// is not noticed.
+// exist stays not found. The policy evaluated is therefore the one stored
+// for the queue acted on. A tag or the policy changed between this read
+// and the operation is not noticed.
 //
 // tule.dev/policy matches key names without regard to case, so tags that
 // differ only by case would feed one aws:ResourceTag key. A request that
 // would add a key differing only by case from a stored one is refused as a
 // repeated key, and a queue that already holds such keys (a root user
 // wrote them) is not evaluated at all.
-func (m *Module) withResourceTags(
+func (m *Module) readQueue(
 	c *call, t accessTarget, ctx map[string][]string,
-) (map[string][]string, error) {
-	id, tags, err := m.store.QueueTags(c, t.queue)
+) (map[string][]string, string, error) {
+	q, err := m.store.QueueAccess(c, t.queue)
 	if errors.Is(err, contracts.ErrQueueNotFound) {
 		c.pinned = contracts.WithQueuePin(c.Context, t.queue, 0)
-		return ctx, nil
+		return ctx, "", nil
 	}
 	if err != nil {
-		return nil, err //nolint:wrapcheck // the store's error, logged by ToError
+		return nil, "", err //nolint:wrapcheck // the store's error, logged by ToError
 	}
-	c.pinned = contracts.WithQueuePin(c.Context, t.queue, id)
-	stored := make(map[string]string, len(tags))
-	for k := range tags {
+	c.pinned = contracts.WithQueuePin(c.Context, t.queue, q.ID)
+	stored := make(map[string]string, len(q.Tags))
+	for k := range q.Tags {
 		lower := strings.ToLower(k)
 		if other, dup := stored[lower]; dup {
-			return nil, fmt.Errorf("authorize: queue %s holds tag keys %q and %q, "+
+			return nil, "", fmt.Errorf("authorize: queue %s holds tag keys %q and %q, "+
 				"which differ only by case", t.queue, other, k)
 		}
 		stored[lower] = k
 	}
 	for _, k := range t.tagKeys {
 		if s, ok := stored[strings.ToLower(k)]; ok && s != k {
-			return nil, sqsapi.ErrTagKeyCaseCollision(k)
+			return nil, "", sqsapi.ErrTagKeyCaseCollision(k)
 		}
 	}
-	out := make(map[string][]string, len(ctx)+len(tags))
+	out := make(map[string][]string, len(ctx)+len(q.Tags))
 	for k, v := range ctx {
 		out[k] = v
 	}
-	for k, v := range tags {
+	for k, v := range q.Tags {
 		out["aws:ResourceTag/"+k] = []string{v}
 	}
-	return out, nil
+	return out, q.Policy, nil
 }
 
 // queueRequest is a request of type T that names its queue by QueueUrl.

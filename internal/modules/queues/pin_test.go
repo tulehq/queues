@@ -27,11 +27,8 @@ type pinStore struct {
 
 const evaluatedID contracts.QueueID = 7
 
-func (s *pinStore) QueueTags(
-	context.Context,
-	string,
-) (contracts.QueueID, map[string]string, error) {
-	return evaluatedID, map[string]string{}, nil
+func (s *pinStore) QueueAccess(context.Context, string) (*contracts.QueueAccess, error) {
+	return &contracts.QueueAccess{ID: evaluatedID, Tags: map[string]string{}}, nil
 }
 
 func (s *pinStore) QueueInfo(ctx context.Context, name string) (*contracts.Queue, error) {
@@ -52,6 +49,8 @@ func TestTheOperationRunsPinnedToTheEvaluatedQueue(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "http://queues.local/", strings.NewReader(body))
 	r = r.WithContext(sigv4.NewContext(r.Context(), sigv4.Principal{
 		AccountID: "000000000000", ARN: "arn:aws:iam::000000000000:user/dev",
+		PrincipalARN: "arn:aws:iam::000000000000:user/dev", UserID: "AIDAEXAMPLEUSERID01",
+		Type: sigv4.PrincipalTypeUser,
 		Policies: []json.RawMessage{
 			json.RawMessage(
 				`{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"sqs:*","Resource":"*"}}`,
