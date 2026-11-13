@@ -270,11 +270,11 @@ type QueueProvider interface {
 	// RedrivePolicy targets the queue.
 	ListDeadLetterSourceQueues(ctx context.Context, name string,
 		page PageInput) (*Page[string], error)
-	// AddPermission and RemovePermission write the queue's Policy with a
-	// statement added or removed, as bind returns it; nil stores it as
-	// written.
+	// AddPermission adds the statement p generates to the queue's Policy,
+	// as bind returns that statement alone; nil stores it as generated.
 	AddPermission(ctx context.Context, name string, p Permission, bind BindFunc) error
-	RemovePermission(ctx context.Context, name, label string, bind BindFunc) error
+	// RemovePermission removes a statement, binding nothing.
+	RemovePermission(ctx context.Context, name, label string) error
 
 	// SendMessages sends messages in order, all or none.
 	SendMessages(ctx context.Context, name string, msgs []SendInput) ([]SendResult, error)

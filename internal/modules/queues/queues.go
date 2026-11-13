@@ -259,5 +259,5 @@ func (m *Module) removePermission(c *call) (any, error) {
 	if err = sqsapi.CheckLabel(label); err != nil {
 		return nil, err
 	}
-	return nil, m.store.RemovePermission(c, name, label, m.binder())
+	return nil, m.store.RemovePermission(c, name, label)
 }

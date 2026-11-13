@@ -261,60 +261,48 @@ func TestEveryPolicyWriteBinds(t *testing.T) {
 	requireAsked(t, ids, "GetQueueAttributes after RemovePermission", []string{devID})
 }
 
-// TestAPolicyStoredUnboundIsBoundWhenAPermissionChanges stores policies
-// without identity, as an earlier release did, then edits them with
-// AddPermission and RemovePermission against identity, which bind what
-// they write.
-func TestAPolicyStoredUnboundIsBoundWhenAPermissionChanges(t *testing.T) {
+// TestAPermissionChangeLeavesTheRestOfAnUnboundPolicy stores a policy
+// without identity, as an earlier release did, then changes its
+// permissions against identity once the IAM user it names is deleted:
+// RemovePermission binds nothing and AddPermission only the statement it
+// generates, so neither is refused for the stale principal, and the other
+// statements stay as stored.
+func TestAPermissionChangeLeavesTheRestOfAnUnboundPolicy(t *testing.T) {
 	dir := t.TempDir()
-	doc := `{"Version":"2012-10-17","Statement":[` +
-		`{"Sid":"Dev","Effect":"Allow","Principal":{"AWS":"` + devARN + `"},` +
-		`"Action":"sqs:SendMessage","Resource":"` + ordersARN + `"},` +
-		`{"Sid":"Other","Effect":"Allow","Principal":{"AWS":"` + devARN + `"},` +
+	dev := `{"Sid":"Dev","Effect":"Allow","Principal":{"AWS":"` + devARN + `"},` +
+		`"Action":"sqs:SendMessage","Resource":"` + ordersARN + `"}`
+	doc := `{"Version":"2012-10-17","Statement":[` + dev + `,` +
+		`{"Sid":"Other","Effect":"Allow","Principal":{"AWS":"111122223333"},` +
 		`"Action":"sqs:ReceiveMessage","Resource":"` + ordersARN + `"}]}`
 	t.Run("standalone", func(t *testing.T) {
 		c, _ := startApp(t, dir, nil)
 		createQueue(t, c, "orders", map[string]string{"Policy": doc})
-		createQueue(t, c, "returns", map[string]string{"Policy": doc})
-		createQueue(t, c, "stale", map[string]string{"Policy": doc})
 	})
 
 	c, base, ids := startBindingApp(t, dir)
-	// Read back as stored: nothing in it is an ID.
-	if got := policyOf(t, c, base+"/000000000000/orders"); got != doc {
-		t.Fatalf("unbound Policy:\n got %s\nwant %s", got, doc)
-	}
+	u := base + "/000000000000/orders"
+	ids.set(map[string]string{}, 0)
+
+	removePermission(t, c, u, "Other")
+	requireAsked(t, ids, "RemovePermission")
+	requirePolicy(t, c, u, `{"Version":"2012-10-17","Statement":[`+dev+`]}`)
 	requireAsked(t, ids, "reading an unbound policy")
 
-	if err := addPermission(t, c, base+"/000000000000/orders", "partner"); err != nil {
-		t.Fatalf("AddPermission: %v", err)
+	if err := addPermission(t, c, u, "partner"); err != nil {
+		t.Fatalf("AddPermission beside a deleted user: %v", err)
 	}
-	requireAsked(t, ids, "AddPermission", []string{devARN})
-	_ = policyOf(t, c, base+"/000000000000/orders")
-	requireAsked(t, ids, "reading the policy AddPermission wrote", []string{devID})
+	requireAsked(t, ids, "AddPermission")
+	if got := policyOf(t, c, u); !strings.HasPrefix(got,
+		`{"Version":"2012-10-17","Statement":[`+dev+`,`) {
+		t.Fatalf("Policy after AddPermission: %s", got)
+	}
 
-	removePermission(t, c, base+"/000000000000/returns", "Other")
-	requireAsked(t, ids, "RemovePermission", []string{devARN})
-	_ = policyOf(t, c, base+"/000000000000/returns")
-	requireAsked(t, ids, "reading the policy RemovePermission wrote", []string{devID})
-
-	// An unbound policy naming a user that no longer exists cannot be
-	// bound, so a permission change on it is refused as an invalid Policy,
-	// while a bound one keeps the gone user's ID and is changed.
-	ids.set(map[string]string{}, 0)
-	add := func(queue string) error {
-		return addPermission(t, c, base+"/000000000000/"+queue, "more")
-	}
-	requireAPIError(t, add("stale"), "InvalidAttributeValue", http.StatusBadRequest)
-	if got := policyOf(t, c, base+"/000000000000/stale"); got != doc {
-		t.Fatalf("Policy after the refused AddPermission:\n got %s\nwant %s", got, doc)
-	}
-	if err := add("returns"); err != nil {
-		t.Fatalf("AddPermission on a bound policy whose user is gone: %v", err)
-	}
-	if got := policyOf(t, c, base+"/000000000000/returns"); !strings.Contains(got, `"`+devID+`"`) {
-		t.Fatalf("a bound policy whose user is gone shows: %s", got)
-	}
+	// Writing the Policy itself binds the whole document, and refuses the
+	// deleted user.
+	_, err := c.SetQueueAttributes(t.Context(), &sqs.SetQueueAttributesInput{
+		QueueUrl: aws.String(u), Attributes: map[string]string{"Policy": doc},
+	})
+	requireAPIError(t, err, "InvalidAttributeValue", http.StatusBadRequest)
 }
 
 func TestAPolicyNamingAMissingPrincipalIsRefused(t *testing.T) {
@@ -367,6 +355,14 @@ func TestIdentityUnreachableFailsPolicyWritesAndReads(t *testing.T) {
 	if status, _ := inspectedPolicy(t, base); status != http.StatusInternalServerError {
 		t.Fatalf("inspection: status %d, want 500", status)
 	}
+
+	// A revocation needs no identity, nor does an AddPermission, whose
+	// statement names only accounts.
+	if err = addPermission(t, c, u, "partner"); err != nil {
+		t.Fatalf("AddPermission while identity fails: %v", err)
+	}
+	removePermission(t, c, u, "partner")
+	removePermission(t, c, u, "Grant")
 
 	// A policy without an ID or ARN to resolve needs no identity, nor does
 	// a write or read without a policy.
