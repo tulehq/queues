@@ -207,6 +207,17 @@ user or role the policy it needs, such as `sqs:*` on `*`.
   evaluated request with `500` `InternalFailure`, and every write or read
   of a policy naming a user or role.
 
+**Changes in v0.5.0.**
+
+- The message move task operations are served
+  ([Message move tasks](#message-move-tasks)). Starting one needs, besides
+  `sqs:StartMessageMoveTask`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`
+  and `sqs:GetQueueAttributes` on the source and `sqs:SendMessage` on every
+  queue it moves messages to.
+- A message moved to a FIFO dead-letter queue takes its own message ID as
+  its deduplication ID, as SQS replaces it, where v0.4.0 kept the one it
+  was sent with. Messages already in a dead-letter queue keep theirs.
+
 Each operation is evaluated as the action and resource the SQS Service
 Authorization Reference gives it (the table is `operationAccess` in
 `internal/modules/queues/access.go`, checked by a test against the
