@@ -641,7 +641,15 @@ as a receive does: while any of the group's messages is in flight, and
 behind a message of the group that is not visible, it moves none of the
 group's messages, and moves the other groups. It comes back to a held
 group every 250 milliseconds, and moves it once its message in flight is
-deleted or visible again. The task is `COMPLETED` once none of the
+deleted or visible again. A step reads the source in queue order and
+stops once it has its messages. When it reads four times as many visible
+messages as the source has groups, and at least 256, without finding
+them, as behind a long backlog of a held group, it walks the source's
+groups instead, as a FIFO receive does: a seek per group and a read of
+each group's messages that are not visible. The task counts the groups
+once, at its first step. A message read costs about a quarter of a group
+walked, so a step costs a small multiple of the cheaper of reading the
+backlog and walking the groups. The task is `COMPLETED` once none of the
 messages it started on is left visible in the source, a held group's
 included.
 
