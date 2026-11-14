@@ -594,10 +594,16 @@ in order within a group, and a group is held while any of its messages is
 in flight. Each stored message gets the next `SequenceNumber`.
 
 A message whose receive count has reached its queue's `maxReceiveCount` is
-moved to the dead-letter queue instead of being received again. The
-dead-letter queue must exist, be of the same type, not be the queue
-itself, and allow the queue in its `RedriveAllowPolicy`, else the
-`RedrivePolicy` fails with `InvalidParameterValue`.
+moved to the dead-letter queue instead of being received again. A FIFO
+message's deduplication ID there is its `MessageId`, as the developer
+guide's "Learn how to configure a dead-letter queue redrive in Amazon SQS"
+notes ("the original message's deduplication ID will be replaced with the
+original message's ID"), so two messages that shared a deduplication ID
+stay apart, and a receive from the dead-letter queue reports the
+`MessageId` as `MessageDeduplicationId`. The dead-letter queue must
+exist, be of the same type, not be the queue itself, and allow the queue
+in its `RedriveAllowPolicy`, else the `RedrivePolicy` fails with
+`InvalidParameterValue`.
 
 ### Message move tasks
 
@@ -854,7 +860,9 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
     the oldest message". Moved
     messages are not delayed by the destination's `DelaySeconds`, and a
     FIFO destination neither deduplicates them nor records their
-    deduplication IDs.
+    deduplication IDs. A message a `RedrivePolicy` moved to a FIFO
+    dead-letter queue keeps the `MessageDeduplicationId` it has there,
+    its original `MessageId`.
   - A message move task without a `DestinationArn` fails on the first
     message with no `DeadLetterQueueSourceArn`, rather than skipping it.
   - A task started without a `DestinationArn` is authorized for

@@ -280,6 +280,50 @@ func TestRedriveMovesAMessagePastMaxReceiveCount(t *testing.T) {
 	}
 }
 
+func TestAFIFODeadLetterMoveReplacesTheDeduplicationID(t *testing.T) {
+	s, c := newStore(t)
+	createQueue(t, s, "dlq.fifo", true, nil)
+	createQueue(t, s, "src.fifo", true, map[string]string{
+		"VisibilityTimeout":  "1",
+		"DeduplicationScope": "messageGroup",
+		"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq.fifo",` +
+			`"maxReceiveCount":1}`,
+	})
+	sent := send(t, s, "src.fifo",
+		contracts.SendInput{Body: "a", GroupID: "g1", DeduplicationID: "shared"},
+		contracts.SendInput{Body: "b", GroupID: "g2", DeduplicationID: "shared"})
+	ids := map[string]string{"a": sent[0].MessageID, "b": sent[1].MessageID}
+	requireBodies(t, receive(t, s, "src.fifo", 10), "a", "b")
+	c.advance(time.Second)
+	requireBodies(t, receive(t, s, "src.fifo", 10))
+
+	moved := receive(t, s, "dlq.fifo", 10)
+	requireBodies(t, moved, "a", "b")
+	for _, m := range moved {
+		if m.ID != ids[m.Body] || m.DeduplicationID != m.ID {
+			t.Fatalf("message %s in the dead-letter queue = ID %s, deduplication ID %s, "+
+				"want both %s", m.Body, m.ID, m.DeduplicationID, ids[m.Body])
+		}
+	}
+
+	// A move task back keeps the dead-letter queue's deduplication IDs and
+	// deduplicates nothing.
+	c.advance(31 * time.Second)
+	startMove(t, s, "dlq.fifo", "", 0)
+	if done := waitMove(t, s, "dlq.fifo"); done.Status != contracts.MoveTaskCompleted ||
+		done.Moved != 2 {
+		t.Fatalf("ended task = %+v, want both moved", done)
+	}
+	back := receive(t, s, "src.fifo", 10)
+	requireBodies(t, back, "a", "b")
+	for _, m := range back {
+		if m.DeduplicationID != ids[m.Body] {
+			t.Fatalf("message %s moved back has deduplication ID %s, want %s",
+				m.Body, m.DeduplicationID, ids[m.Body])
+		}
+	}
+}
+
 func TestRedriveChecksTheDeadLetterQueue(t *testing.T) {
 	s, _ := newStore(t)
 	createQueue(t, s, "fifo-dlq.fifo", true, nil)
