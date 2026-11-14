@@ -333,7 +333,11 @@ func markReceived(ctx context.Context, tx *sql.Tx, t *taking, m *messageRow) err
 // DeadLetterQueueSourceArn. A standard queue's message keeps its enqueue
 // time, so its retention still counts from when it was first sent; a FIFO
 // queue's starts again, as the SQS developer guide describes both. A FIFO
-// message takes the dead-letter queue's next sequence number.
+// message takes the dead-letter queue's next sequence number, and its
+// message ID becomes its deduplication ID, as the developer guide's "Learn
+// how to configure a dead-letter queue redrive in Amazon SQS" notes, so two
+// messages that shared a deduplication ID stay apart in the dead-letter
+// queue.
 func (s *Service) moveToDeadLetter(ctx context.Context, tx *sql.Tx, q *queueRow, m *messageRow,
 	p *contracts.RedrivePolicy, now time.Time,
 ) (string, error) {
@@ -350,9 +354,11 @@ func (s *Service) moveToDeadLetter(ctx context.Context, tx *sql.Tx, q *queueRow,
 	}
 	enqueuedAt := m.enqueuedAt
 	seq := m.msg.SequenceNumber
+	dedup := m.msg.DeduplicationID
 	if q.fifo {
 		enqueuedAt = stamp(now)
 		seq = sequenceNumber(dlq.nextSeq)
+		dedup = m.msg.ID
 		if err = exec(ctx, tx, `UPDATE queues SET next_sequence = ? WHERE id = ?`,
 			dlq.nextSeq+1, dlq.id); err != nil {
 			return "", err
@@ -365,9 +371,9 @@ func (s *Service) moveToDeadLetter(ctx context.Context, tx *sql.Tx, q *queueRow,
 		   sequence_number, dlq_source_arn)
 		 SELECT ?, message_id, body, md5_body, attributes, md5_attributes,
 		   system_attributes, md5_system, sender_id, sent_at, ?, ?, receive_count,
-		   first_received_at, group_id, dedup_id, ?, ?
+		   first_received_at, group_id, ?, ?, ?
 		 FROM messages WHERE id = ?`,
-		dlq.id, enqueuedAt, stamp(now), seq, s.settings.ARN(q.name), m.id); err != nil {
+		dlq.id, enqueuedAt, stamp(now), dedup, seq, s.settings.ARN(q.name), m.id); err != nil {
 		return "", err
 	}
 	return name, exec(ctx, tx, `DELETE FROM messages WHERE id = ?`, m.id)

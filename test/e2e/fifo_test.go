@@ -390,3 +390,51 @@ func TestFIFOReceiveRequestAttemptID(t *testing.T) {
 	})
 	requireEqual(t, len(other), 0, "a different attempt")
 }
+
+func TestFIFODeadLetterDeduplicationID(t *testing.T) {
+	// "When a message is moved from a FIFO queue to a FIFO DLQ, the original
+	// message's deduplication ID will be replaced with the original
+	// message's ID. This is to make sure that the DLQ deduplication will not
+	// prevent storing of two independent messages that happen to share a
+	// deduplication ID" (Developer Guide, "Learn how to configure a
+	// dead-letter queue redrive in Amazon SQS").
+	c, _ := newClient(t)
+	dlq := createFIFO(t, c, "dead.fifo", nil)
+	dlqARN := arnOf(t, c, dlq)
+	src := createFIFO(t, c, "work.fifo", map[string]string{
+		"DeduplicationScope": "messageGroup", "RedrivePolicy": redrivePolicy(dlqARN, 1),
+	})
+	ids := map[string]string{
+		"a": aws.ToString(sendFIFO(t, c, src, "a", "g1", "shared").MessageId),
+		"b": aws.ToString(sendFIFO(t, c, src, "b", "g2", "shared").MessageId),
+	}
+	got := receive(t, c, src, 10)
+	requireEqual(t, len(got), 2, "messages received once before the DLQ")
+	for _, m := range got {
+		changeVisibility(t, c, src, m, 0)
+	}
+	// The next receive exceeds maxReceiveCount 1 for both.
+	requireEmpty(t, c, src, "the source once its messages went to the DLQ")
+
+	moved := receive(t, c, dlq, 10)
+	requireSameSet(t, bodies(moved), []string{"a", "b"}, "bodies in the DLQ")
+	for _, m := range moved {
+		id := ids[aws.ToString(m.Body)]
+		requireEqual(t, aws.ToString(m.MessageId), id, "MessageId in the DLQ")
+		requireEqual(t, m.Attributes["MessageDeduplicationId"], id,
+			"MessageDeduplicationId in the DLQ")
+		changeVisibility(t, c, dlq, m, 0)
+	}
+
+	// Assumption: a redriven message keeps the deduplication ID it has in
+	// the DLQ, the original message's ID, and the redrive does not
+	// deduplicate it, so both come back.
+	startMove(t, c, moveTo(dlqARN, "", 0))
+	requireEnded(t, waitMove(t, c, dlqARN), moveCompleted, 2, dlqARN, "", 0)
+	back := receive(t, c, src, 10)
+	requireSameSet(t, bodies(back), []string{"a", "b"}, "bodies moved back to the source")
+	for _, m := range back {
+		requireEqual(t, m.Attributes["MessageDeduplicationId"], ids[aws.ToString(m.Body)],
+			"MessageDeduplicationId of a message moved back")
+	}
+}
