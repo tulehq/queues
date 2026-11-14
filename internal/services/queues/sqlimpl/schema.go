@@ -110,4 +110,35 @@ DROP TABLE queue_tags;
 DROP TABLE queues;
 `,
 	},
+	{
+		Version:     "0002",
+		Description: "create the message move tasks",
+		// A task belongs to its source queue, queue_id, and goes with it.
+		// up_to is the last message row it may move. max_per_second is 0
+		// for the system-optimized rate, and destination_arn "" for a task
+		// that moves each message back to the queue it came from. run is
+		// the server run that started the task: a task left running or
+		// canceling by an earlier run is no longer moving anything.
+		Up: `
+CREATE TABLE move_tasks (
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	queue_id        INTEGER NOT NULL,
+	handle          TEXT NOT NULL UNIQUE,
+	destination_arn TEXT NOT NULL,
+	max_per_second  INTEGER NOT NULL,
+	status          TEXT NOT NULL,
+	to_move         INTEGER NOT NULL,
+	moved           INTEGER NOT NULL DEFAULT 0,
+	up_to           INTEGER NOT NULL,
+	failure_reason  TEXT NOT NULL DEFAULT '',
+	started_at      INTEGER NOT NULL,
+	run             TEXT NOT NULL
+);
+CREATE INDEX move_tasks_queue ON move_tasks (queue_id, id);
+CREATE INDEX move_tasks_status ON move_tasks (status);
+`,
+		Down: `
+DROP TABLE move_tasks;
+`,
+	},
 }

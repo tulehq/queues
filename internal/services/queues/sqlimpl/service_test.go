@@ -73,10 +73,17 @@ func newStore(t testing.TB) (*Service, *clock) {
 
 	c := &clock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
 	settings := testSettings
-	s := NewService(&settings, c.Now)(db, mm, gas.NewEventBus())
+	s := NewService(&settings, c.Now)(db, mm, gas.NewEventBus(), logger)
 	if err = s.Init(ctx); err != nil {
 		t.Fatalf("init store: %v", err)
 	}
+	// Cleanups run last first: the store's move tasks stop before the
+	// database closes, as gas closes them.
+	t.Cleanup(func() {
+		if cErr := s.Close(ctx); cErr != nil {
+			t.Errorf("close store: %v", cErr)
+		}
+	})
 	if err = mm.RunPendingContext(ctx); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}

@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
-	"github.com/aws/smithy-go"
 )
 
 // fakeClock is a clock a test moves by hand.
@@ -175,19 +174,6 @@ func TestTheSDKDecodesAQueueCompatibleError(t *testing.T) {
 	// reports as the error code.
 	if got := missing.ErrorCode(); got != "AWS.SimpleQueueService.NonExistentQueue" {
 		t.Fatalf("error code = %s, want AWS.SimpleQueueService.NonExistentQueue", got)
-	}
-}
-
-func TestAnUnservedOperationIsAnInvalidAction(t *testing.T) {
-	c, _ := startApp(t, t.TempDir(), nil)
-	url := createQueue(t, c, "moves", nil)
-
-	_, err := c.ListMessageMoveTasks(t.Context(), &sqs.ListMessageMoveTasksInput{
-		SourceArn: aws.String("arn:aws:sqs:us-east-1:000000000000:moves"),
-	})
-	var apiErr smithy.APIError
-	if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "InvalidAction" {
-		t.Fatalf("list message move tasks on %s = %v, want InvalidAction", url, err)
 	}
 }
 

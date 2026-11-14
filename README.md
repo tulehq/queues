@@ -109,9 +109,10 @@ evaluation logic" describe:
   identity `Allow` in its own account and a queue policy `Allow`, through
   its account or directly. Another account's root user has every identity
   permission in its own account, so it needs only the queue policy.
-- `AddPermission`, `CreateQueue`, `DeleteQueue`, `ListQueues`,
-  `ListQueueTags`, `RemovePermission`, `SetQueueAttributes`, `TagQueue` and
-  `UntagQueue` are never shared across accounts: "Cross-account
+- `AddPermission`, `CancelMessageMoveTask`, `CreateQueue`, `DeleteQueue`,
+  `ListMessageMoveTasks`, `ListQueues`, `ListQueueTags`, `RemovePermission`,
+  `SetQueueAttributes`, `StartMessageMoveTask`, `TagQueue` and `UntagQueue`
+  are never shared across accounts: "Cross-account
   permissions don't apply to the following actions" (SQS Developer Guide,
   "Basic examples of Amazon SQS policies", and each one's API reference). A
   principal of another account is evaluated on them with the queue's
@@ -218,11 +219,18 @@ reference's JSON in `internal/modules/queues/testdata`):
 | `SendMessage`, `SendMessageBatch` | `sqs:SendMessage` | the queue |
 | `DeleteMessage`, `DeleteMessageBatch` | `sqs:DeleteMessage` | the queue |
 | `ChangeMessageVisibility`, `ChangeMessageVisibilityBatch` | `sqs:ChangeMessageVisibility` | the queue |
+| `StartMessageMoveTask` | `sqs:StartMessageMoveTask`, `sqs:ReceiveMessage`, `sqs:DeleteMessage` and `sqs:GetQueueAttributes` | the source queue |
+| | `sqs:SendMessage` | the destination, or without one each queue the messages it would move came from |
+| `CancelMessageMoveTask` | `sqs:CancelMessageMoveTask`, `sqs:ReceiveMessage`, `sqs:DeleteMessage` and `sqs:GetQueueAttributes` | the source queue its `TaskHandle` names |
+| `ListMessageMoveTasks` | `sqs:ListMessageMoveTasks` and `sqs:GetQueueAttributes` | the source queue |
 | Every other operation | `sqs:<Operation>` | the queue |
 
 A queue is `arn:aws:sqs:<region>:<account>:<name>`, in the configured
 account and region. A batch is allowed or denied whole, as its entries all
-name its one queue.
+name its one queue. The message move task operations are authorized as the
+reference's `Operations` list them, which are the minimum permissions the
+developer guide's "Configuring queue permissions for dead-letter queue
+redrive" gives; each queue is evaluated with its own tags and `Policy`.
 
 The condition keys supplied are `aws:SourceIp` (the connection's address),
 `aws:CurrentTime`, `aws:EpochTime`, `aws:SecureTransport`,
@@ -523,6 +531,9 @@ one-item forms without an index that the API reference's examples show
 | `ReceiveMessage` | `MaxNumberOfMessages`, `VisibilityTimeout`, `WaitTimeSeconds` long polling, `MessageAttributeNames` (`All`, `.*`, `prefix.*`), `MessageSystemAttributeNames` and the deprecated `AttributeNames`, `ReceiveRequestAttemptId` on FIFO queues |
 | `DeleteMessage` / `DeleteMessageBatch` | |
 | `ChangeMessageVisibility` / `ChangeMessageVisibilityBatch` | |
+| `StartMessageMoveTask` | Moves a dead-letter queue's messages to `DestinationArn`, or back to the queues they came from, in the background, at up to `MaxNumberOfMessagesPerSecond` (1 to 500) ([Message move tasks](#message-move-tasks)) |
+| `ListMessageMoveTasks` | The source queue's most recent tasks, `MaxResults` 1 to 10, default 1 |
+| `CancelMessageMoveTask` | Cancels a `RUNNING` task; what it moved stays moved |
 
 The queue attributes are SQS's: `DelaySeconds` (0 to 900, default 0),
 `MaximumMessageSize` (1024 to 1048576, default 1048576),
@@ -568,7 +579,8 @@ number of groups only. A standard receive reads only the messages it
 takes. Neither grows with the rest of the queue.
 
 A long poll returns as soon as it has one message. It waits on a signal
-that a send, a visibility change, a delete or a dead-letter move raises,
+that a send, a visibility change, a delete, a dead-letter move or a
+message move task raises,
 and on a timer for the next delayed or in-flight message, not by polling
 the store.
 
@@ -586,6 +598,87 @@ moved to the dead-letter queue instead of being received again. The
 dead-letter queue must exist, be of the same type, not be the queue
 itself, and allow the queue in its `RedriveAllowPolicy`, else the
 `RedrivePolicy` fails with `InvalidParameterValue`.
+
+### Message move tasks
+
+A message move task moves a dead-letter queue's messages out of it, as the
+developer guide's "Learn how to configure a dead-letter queue redrive in
+Amazon SQS" describes. `StartMessageMoveTask`'s `SourceArn` must name a
+queue that another queue's `RedrivePolicy` names as its dead-letter queue
+("only ARNs of dead-letter queues (DLQs) whose sources are other Amazon SQS
+queues are accepted", API reference), else it fails with
+`UnsupportedOperation`. With a `DestinationArn`, every message goes there;
+the destination must be of the source's type ("if both queues are the same
+type", developer guide) and not be the source, else
+`InvalidParameterValue`. Without one, or with it blank, each message goes
+back to the queue its `DeadLetterQueueSourceArn` names, the queue a receive
+moved it from ("If this field is left blank, the messages will be redriven
+back to their respective original source queues"). A source or destination
+that does not exist fails with `ResourceNotFoundException`, the error the
+API reference lists for "One or more specified resources don't exist". A
+source with a task `RUNNING` or `CANCELLING` fails with
+`UnsupportedOperation`: "Only one active message movement task is supported
+per queue at any given time".
+
+The task runs in the background, in the server. It moves the visible
+messages the source holds when it starts, oldest first ("Dead-letter
+queues redrive messages in the order they are received, starting with the
+oldest message"), up to 10 in each transaction, so a task never holds the
+store's one connection for long. `MaxNumberOfMessagesPerSecond` paces it:
+after each step it waits until the messages it moved fit the rate, so it
+never moves more than that many in a second. Without one, the API
+reference's "system will optimize the rate", it moves as fast as the store
+takes the steps, without pausing. A moved message arrives as a new one, as
+the developer guide describes ("All redriven messages are considered new
+messages with a new `messageID` and `enqueueTime`"; "The redrive task
+resets the retention period"): a new `MessageId`, visible at once, never
+received, with no `DeadLetterQueueSourceArn`. Its body, attributes,
+`SenderId` and `SentTimestamp` are kept; on a FIFO destination it keeps its
+`MessageGroupId` and `MessageDeduplicationId` and takes the destination's
+next `SequenceNumber`. Long polls on the destination wake as the messages
+arrive. On a FIFO source the task keeps each group's order, holding a group
+as a receive does: while any of the group's messages is in flight, and
+behind a message of the group that is not visible, it moves none of the
+group's messages, and moves the other groups. It comes back to a held
+group every 250 milliseconds, and moves it once its message in flight is
+deleted or visible again. The task is `COMPLETED` once none of the
+messages it started on is left visible in the source, a held group's
+included.
+
+`ListMessageMoveTasks` returns up to `MaxResults` of the source's most
+recent tasks ("The default is 1, which provides the most recent message
+movement task. The upper limit is 10"). `ApproximateNumberOfMessagesToMove`
+is the source's visible messages when the task started ("obtained at the
+time of starting the message movement task"), and
+`ApproximateNumberOfMessagesMoved` is exact. As
+`ListMessageMoveTasksResultEntry` documents, `TaskHandle` is listed only
+while the task is `RUNNING`, `DestinationArn` and
+`MaxNumberOfMessagesPerSecond` only when the start gave them, and
+`FailureReason` only for a `FAILED` task. `StartedTimestamp` is epoch
+milliseconds, as the API reference's example shows. A `TaskHandle` is
+base64 of a JSON object holding the task's ID and its source's ARN, the
+form the example's handle decodes to; it is opaque to clients.
+
+`CancelMessageMoveTask` cancels a `RUNNING` task and returns how many
+messages it has moved. The task is `CANCELLING` until it stops between two
+steps, which the cancel wakes it for, and then `CANCELLED`; the messages it
+moved stay in the destination ("Cancelling a message movement task does
+not revert the messages that have already been moved"). A task that is not
+`RUNNING` fails with `UnsupportedOperation`, and a handle that names no
+task with `ResourceNotFoundException`.
+
+A task fails, `FAILED` with a `FailureReason`, on a message it cannot move:
+one with no source queue to go back to (sent to the dead-letter queue
+directly, not moved there by a `RedrivePolicy`) when the start gave no
+`DestinationArn`, or one whose destination no longer exists. The messages
+it moved before stay moved, and the one it stopped on and those after it
+stay in the source.
+
+The tasks stop when the server shuts down; nothing resumes them. When the
+server starts again, a task it left `RUNNING` is reported `FAILED` with the
+`FailureReason` "The server stopped while the task was running.", and one
+it left `CANCELLING` is `CANCELLED`. The messages it had not moved are still
+in the source, for a new task. A queue's tasks are deleted with it.
 
 ## Inspection API
 
@@ -686,10 +779,13 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
   as SQS's errors: a name deleted less than 60 seconds ago fails
   `CreateQueue` with `QueueDeletedRecently`, and a second purge within 60
   seconds fails with `PurgeQueueInProgress`.
-- **Message move tasks are not served.** `StartMessageMoveTask`,
-  `CancelMessageMoveTask`, `ListMessageMoveTasks`, and any other operation
-  not listed above, answer as an action SQS does not know: `400`
-  `InvalidAction`, over either protocol.
+- **An operation not listed above** answers as an action SQS does not
+  know: `400` `InvalidAction`, over either protocol.
+- **Message move task quotas are not enforced.** A task may run longer
+  than the 36 hours SQS allows, and an account may have more than the 100
+  active tasks SQS allows (developer guide, dead-letter queue redrive).
+  Tasks run in the server, not beside it: they stop with it (see
+  [Message move tasks](#message-move-tasks)).
 - **Choices where AWS documents none.**
   - Receipt handles are opaque base64 and name one receive. A
     `DeleteMessage` with an earlier receive's handle succeeds and deletes
@@ -739,13 +835,45 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
     accepted and not stored. AWS documents nothing either way for a purge.
     The inspection API's `DELETE /_queues/messages` clears them.
   - `SenderId` is the access key ID that signed the send.
+  - The message move task refusals AWS does not assign a code: a source
+    that is no dead-letter queue, a source with an active task, and a
+    cancel of a task that is not `RUNNING` fail with
+    `UnsupportedOperation`, which the three operations list; a destination
+    of the other queue type, or the source itself, with
+    `InvalidParameterValue`. A `SourceArn` or `DestinationArn` that is no
+    SQS ARN fails with `InvalidParameterValue`; an SQS ARN of another
+    account or region, and a `TaskHandle` that names no task, fail with
+    `ResourceNotFoundException`, before the request is evaluated, as a
+    queue URL of another account fails with `QueueDoesNotExist`.
+  - A message move task moves only the messages its source held when it
+    started, and of those only the ones visible as it reaches them: on a
+    standard source, a message in flight or delayed when the task gets to
+    it is left. On a FIFO source, the task waits for a group held by a
+    message in flight rather than leave the group's visible messages
+    behind; AWS documents only that redrive moves messages "starting with
+    the oldest message". Moved
+    messages are not delayed by the destination's `DelaySeconds`, and a
+    FIFO destination neither deduplicates them nor records their
+    deduplication IDs.
+  - A message move task without a `DestinationArn` fails on the first
+    message with no `DeadLetterQueueSourceArn`, rather than skipping it.
+  - A task started without a `DestinationArn` is authorized for
+    `sqs:SendMessage` on each queue the messages it will move came from,
+    read when it starts; AWS sends them as the service itself
+    ("Configuring queue permissions for dead-letter queue redrive" asks
+    the caller for `sqs:SendMessage` on the destination queue).
+  - `ListMessageMoveTasks` lists the tasks oldest first, as the API
+    reference's example does. Its Query result names each task
+    `ListMessageMoveTasksResultEntry`, the SDK model's flattened `xmlName`;
+    the API reference's example shows `Result`.
   - Missing parameters fail with `MissingParameter`, a malformed JSON body
     with `SerializationException`, and a malformed form with
     `MalformedQueryString`.
 - **Error statuses are the SDK model's.** Each SQS error is answered with
   the status its `httpError` and `awsQueryError` traits give in the SDK
   model (`aws-sdk-go-v2/service/sqs` `schemas/schemas.go`): `404` for
-  `ReceiptHandleIsInvalid` and `InvalidAddress`, `403` for
+  `ReceiptHandleIsInvalid`, `InvalidAddress` and
+  `ResourceNotFoundException`, `403` for
   `PurgeQueueInProgress` and `OverLimit` (sent for an `AddPermission` of
   more than seven actions), `400` for the rest. The API
   reference lists `400` for every per-action error. The common errors take

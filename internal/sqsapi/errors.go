@@ -83,6 +83,8 @@ var (
 		"AWS.SimpleQueueService.BatchRequestTooLong", http.StatusBadRequest)
 	shapeUnsupportedOperation = shape("UnsupportedOperation",
 		"AWS.SimpleQueueService.UnsupportedOperation", http.StatusBadRequest)
+	shapeResourceNotFound = shape("ResourceNotFoundException", "ResourceNotFoundException",
+		http.StatusNotFound)
 )
 
 type errorShape struct {
@@ -234,6 +236,14 @@ func ErrUnsupportedOperation(msg string) *Error {
 	return shapeUnsupportedOperation.err(msg)
 }
 
+// ErrResourceNotFound is the error of the message move task operations for
+// a queue or task that does not exist, which they answer with
+// ResourceNotFoundException, "One or more specified resources don't
+// exist" (API reference), rather than QueueDoesNotExist.
+func ErrResourceNotFound(msg string) *Error {
+	return shapeResourceNotFound.err(msg)
+}
+
 // ErrOverLimit is the error for a request that would exceed a fixed quota.
 func ErrOverLimit(msg string) *Error {
 	return shapeOverLimit.err(msg)
@@ -298,6 +308,14 @@ var sentinelErrors = []struct {
 	{contracts.ErrMessageNotInflight, shapeMessageNotInflight.err(
 		"The message referred to isn't in flight.")},
 	{contracts.ErrInvalidToken, ErrInvalidParameterValue("Invalid NextToken value.")},
+	{contracts.ErrMoveTaskNotFound, ErrResourceNotFound(
+		"The task handle names no message move task.")},
+	{contracts.ErrNotDeadLetterQueue, ErrUnsupportedOperation(
+		"The source queue is not configured as the dead-letter queue of another queue.")},
+	{contracts.ErrMoveTaskActive, ErrUnsupportedOperation(
+		"The source queue already has an active message move task.")},
+	{contracts.ErrMoveTaskNotRunning, ErrUnsupportedOperation(
+		"Only a message move task in RUNNING status can be canceled.")},
 }
 
 // ToError maps err to an SQS error, logging it when it maps to an internal

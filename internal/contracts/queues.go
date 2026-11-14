@@ -4,6 +4,8 @@ package contracts
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -32,6 +34,22 @@ var (
 	// ErrInvalidToken is returned by the listings for a NextToken they did
 	// not issue.
 	ErrInvalidToken = errors.New("queues: invalid page token")
+
+	// ErrMoveTaskNotFound is returned by CancelMoveTask for a task handle
+	// that names no task of the queue.
+	ErrMoveTaskNotFound = errors.New("queues: message move task not found")
+
+	// ErrNotDeadLetterQueue is returned by StartMoveTask for a source queue
+	// that no queue's RedrivePolicy names as its dead-letter queue.
+	ErrNotDeadLetterQueue = errors.New("queues: queue is not a dead-letter queue")
+
+	// ErrMoveTaskActive is returned by StartMoveTask for a source queue that
+	// has a task running or being canceled.
+	ErrMoveTaskActive = errors.New("queues: queue has an active message move task")
+
+	// ErrMoveTaskNotRunning is returned by CancelMoveTask for a task that is
+	// not running.
+	ErrMoveTaskNotRunning = errors.New("queues: message move task not running")
 )
 
 // TagKeyCaseError is a TagQueue under a pinned context (an evaluated
@@ -247,6 +265,89 @@ type Page[T any] struct {
 	Items     []T
 }
 
+// The statuses of a message move task, as ListMessageMoveTasks reports
+// them.
+const (
+	MoveTaskRunning    = "RUNNING"
+	MoveTaskCompleted  = "COMPLETED"
+	MoveTaskCancelling = "CANCELLING" //nolint:misspell // SQS's spelling
+	MoveTaskCancelled  = "CANCELLED"  //nolint:misspell // SQS's spelling
+	MoveTaskFailed     = "FAILED"
+)
+
+// MoveScope is what a message move task started on a queue now would move:
+// its messages up to the row UpTo, and the names of the queues those
+// messages were moved to it from (their DeadLetterQueueSourceArn), which a
+// task without a destination sends them back to.
+type MoveScope struct {
+	Origins []string
+	UpTo    int64
+}
+
+// StartMoveInput is a message move task to start.
+type StartMoveInput struct {
+	// MaxPerSecond is nil for the system-optimized rate.
+	MaxPerSecond *int
+	Source       string
+	// Destination is the name of the queue to move the messages to, or ""
+	// to move each back to the queue it came from.
+	Destination string
+	// UpTo is the MoveScope the request was evaluated on: the task moves
+	// none of the source's messages past it.
+	UpTo int64
+}
+
+// MoveTask is a message move task as ListMessageMoveTasks reports it.
+type MoveTask struct {
+	StartedAt time.Time
+	// MaxPerSecond is nil when the task was started without one.
+	MaxPerSecond *int
+	// Handle is the task's handle; ListMessageMoveTasks shows it only
+	// while the task runs.
+	Handle    string
+	Status    string
+	SourceARN string
+	// DestinationARN is "" for a task that moves each message back to the
+	// queue it came from.
+	DestinationARN string
+	// FailureReason is set on a FAILED task.
+	FailureReason string
+	Moved         int64
+	ToMove        int64
+}
+
+// taskHandle is what a task handle carries, as SQS's carry it: the task's
+// ID and its source queue's ARN, as JSON in base64 (the TaskHandle of the
+// API reference's StartMessageMoveTask example decodes to this form).
+type taskHandle struct {
+	TaskID    string `json:"taskId"`
+	SourceARN string `json:"sourceArn"`
+}
+
+// TaskHandle returns the handle of the task id on the queue of sourceARN.
+func TaskHandle(id, sourceARN string) string {
+	raw, err := json.Marshal(taskHandle{TaskID: id, SourceARN: sourceARN})
+	if err != nil {
+		// Two strings always encode.
+		panic("contracts: encode a task handle: " + err.Error())
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+// TaskHandleSource returns the source queue's ARN a task handle carries,
+// or false for a string that is no task handle.
+func TaskHandleSource(handle string) (string, bool) {
+	raw, err := base64.StdEncoding.DecodeString(handle)
+	if err != nil {
+		return "", false
+	}
+	var h taskHandle
+	if json.Unmarshal(raw, &h) != nil || h.TaskID == "" || h.SourceARN == "" {
+		return "", false
+	}
+	return h.SourceARN, true
+}
+
 // QueueProvider stores the queues and their messages.
 type QueueProvider interface {
 	CreateQueue(ctx context.Context, in CreateQueueInput) (*Queue, error)
@@ -287,6 +388,19 @@ type QueueProvider interface {
 	// ChangeVisibility changes the visibility timeouts of received
 	// messages, returning one error, or nil, per change.
 	ChangeVisibility(ctx context.Context, name string, changes []VisibilityChange) ([]error, error)
+
+	// MoveScope returns what a message move task started on the queue now
+	// would move.
+	MoveScope(ctx context.Context, name string) (*MoveScope, error)
+	// StartMoveTask starts a message move task in the background and
+	// returns its handle.
+	StartMoveTask(ctx context.Context, in StartMoveInput) (string, error)
+	// ListMoveTasks returns up to n of the queue's most recent message move
+	// tasks, the oldest first.
+	ListMoveTasks(ctx context.Context, name string, n int) ([]*MoveTask, error)
+	// CancelMoveTask cancels the running task of the handle on the queue
+	// name, and returns how many messages it moved.
+	CancelMoveTask(ctx context.Context, name, handle string) (int64, error)
 
 	// ListMessages lists a queue's messages in queue order without
 	// receiving them.

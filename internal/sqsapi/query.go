@@ -348,6 +348,15 @@ func (p Params) Decode(v any) error {
 			}
 			req.Entries = append(req.Entries, e)
 		}
+	case *StartMessageMoveTaskRequest:
+		req.SourceARN = p.get("SourceArn")
+		req.DestinationARN = p.get("DestinationArn")
+		req.MaxNumberOfMessagesPerSecond, err = p.integer("MaxNumberOfMessagesPerSecond")
+	case *ListMessageMoveTasksRequest:
+		req.SourceARN = p.get("SourceArn")
+		req.MaxResults, err = p.integer("MaxResults")
+	case *CancelMessageMoveTaskRequest:
+		req.TaskHandle = p.get("TaskHandle")
 	default:
 		return fmt.Errorf("sqsapi: no Query decoder for %T", v)
 	}
