@@ -40,9 +40,12 @@ type movers struct {
 	ctx    context.Context //nolint:containedctx // the tasks' lifetime, ended by stop
 	cancel context.CancelFunc
 	wake   map[int64]chan struct{}
+	// wg counts this run's places held: each run has its own, so a task
+	// of a run whose stop gave up waiting never shares one with the next
+	// run, whose claims would reuse it while that stop still waits.
+	wg *sync.WaitGroup
 	// run tells this run's tasks from those of earlier runs.
 	run string
-	wg  sync.WaitGroup
 	mu  sync.Mutex
 }
 
@@ -50,7 +53,9 @@ type movers struct {
 func newMovers() *movers {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	return &movers{ctx: ctx, cancel: cancel, wake: map[int64]chan struct{}{}}
+	return &movers{
+		ctx: ctx, cancel: cancel, wake: map[int64]chan struct{}{}, wg: &sync.WaitGroup{},
+	}
 }
 
 // begin starts the movers under the run run. Tasks of the run before, which
@@ -60,6 +65,7 @@ func (m *movers) begin(run string) {
 	defer m.mu.Unlock()
 	m.cancel()
 	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.wg = &sync.WaitGroup{}
 	m.run = run
 }
 
@@ -71,9 +77,10 @@ func (m *movers) current() string {
 }
 
 // ticket is a place claim holds for a task about to start: the run it
-// belongs to and the lifetime it runs for.
+// belongs to, the lifetime it runs for and the run's count of places.
 type ticket struct {
 	ctx context.Context //nolint:containedctx // the task's lifetime
+	wg  *sync.WaitGroup
 	run string
 }
 
@@ -88,12 +95,12 @@ func (m *movers) claim() (ticket, error) {
 		return ticket{}, errStopped
 	}
 	m.wg.Add(1)
-	return ticket{ctx: m.ctx, run: m.run}, nil
+	return ticket{ctx: m.ctx, wg: m.wg, run: m.run}, nil
 }
 
-// release gives back a place claim held for a task that did not start.
-func (m *movers) release() {
-	m.wg.Done()
+// release gives back the place t holds for a task that did not start.
+func (m *movers) release(t ticket) {
+	t.wg.Done()
 }
 
 // launch runs the task id, for which t was claimed, on a goroutine of its
@@ -107,7 +114,7 @@ func (m *movers) launch(t ticket, id int64, run func(ctx context.Context,
 	woken := make(chan struct{}, 1)
 	m.wake[id] = woken
 	go func() {
-		defer m.wg.Done()
+		defer t.wg.Done()
 		defer func() {
 			m.mu.Lock()
 			delete(m.wake, id)
@@ -129,14 +136,15 @@ func (m *movers) poke(id int64) {
 	}
 }
 
-// stop stops every task and waits for them, up to ctx's end.
+// stop stops every task and waits for those of this run, up to ctx's end.
 func (m *movers) stop(ctx context.Context) error {
 	m.mu.Lock()
 	m.cancel()
+	wg := m.wg
 	m.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
-		m.wg.Wait()
+		wg.Wait()
 		close(done)
 	}()
 	select {
@@ -224,7 +232,7 @@ func (s *Service) StartMoveTask(ctx context.Context, in contracts.StartMoveInput
 		return sErr
 	})
 	if err != nil {
-		s.movers.release()
+		s.movers.release(t)
 		return "", err
 	}
 	s.movers.launch(t, id, func(ctx context.Context, woken <-chan struct{}) {
@@ -402,11 +410,13 @@ func (s *Service) CancelMoveTask(ctx context.Context, name, handle string) (int6
 // runMoveTask runs the task id until it ends or ctx does: a step at a time,
 // pausing after each for as long as the task's rate asks of the messages it
 // moved. A task without a rate does not pause. A cancel wakes it from its
-// pause. A failure of the store fails the task.
+// pause. A failure of the store fails the task. It keeps the task's
+// fifoScanCap across its steps.
 func (s *Service) runMoveTask(ctx context.Context, id int64, woken <-chan struct{}) {
+	scan := 0
 	for {
 		began := time.Now()
-		st, err := s.moveStep(ctx, id)
+		st, err := s.moveStep(ctx, id, &scan)
 		if err != nil {
 			if ctx.Err() == nil {
 				s.failMoveTask(ctx, id, err)
@@ -481,8 +491,10 @@ type stepped struct {
 	held  bool
 }
 
-// moveTaskRow is a task as a step reads it.
+// moveTaskRow is a task as a step reads it, with the fifoScanCap its
+// goroutine keeps, 0 until a step of a FIFO source sets it.
 type moveTaskRow struct {
+	scan        *int
 	status      string
 	destination string
 	queueID     int64
@@ -495,15 +507,15 @@ type moveTaskRow struct {
 // oldest first, at most the task's rate, and completes the task when none
 // is left. A task being canceled is canceled; one that ended, or is gone
 // with its queue, does nothing. The destinations are signaled once the
-// step commits.
-func (s *Service) moveStep(ctx context.Context, id int64) (stepped, error) {
+// step commits. scan is the task's fifoScanCap.
+func (s *Service) moveStep(ctx context.Context, id int64, scan *int) (stepped, error) {
 	var (
 		st    stepped
 		names []string
 	)
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		st, names = stepped{}, nil
-		var t moveTaskRow
+		t := moveTaskRow{scan: scan}
 		found, err := scanOne(ctx, tx,
 			[]any{&t.status, &t.destination, &t.queueID, &t.rate, &t.upTo},
 			`SELECT status, destination_arn, queue_id, max_per_second, up_to
@@ -577,20 +589,90 @@ func (s *Service) moveMessages(ctx context.Context, tx *sql.Tx, id int64, t *mov
 		st.moved, status, reason, id)
 }
 
-// heldFIFO keeps, of a FIFO source's visible messages, those a receive
-// could take: a group is held while any of its messages is in flight, and
-// a message that is not visible holds the messages behind it in its group,
-// as takeFIFO holds them, so a task moves a group's messages in their
-// order.
-const heldFIFO = ` AND NOT EXISTS (
-	SELECT 1 FROM messages x
-	WHERE x.queue_id = messages.queue_id AND x.group_id = messages.group_id
-	  AND x.visible_at > ?2 AND (x.receive_count > 0 OR x.id < messages.id))`
+// A step of a move task on a FIFO source reads the source's visible
+// messages in queue order, through fifoScanned, and stops once it has its
+// messages; only after reading fifoScanCap of them without finding those
+// does it walk the source's groups instead, through fifoToMove, as behind a
+// long backlog of a group held by a message in flight. Both find the same
+// messages, so the cap only weighs their costs: a message read costs about
+// a quarter of a group walked, so the cap is fifoScanPerGroup times the
+// source's groups, counted at the task's first step, and at least
+// fifoScan. With the probe that tells whether the scan reached the cap, a
+// step so costs a small multiple of the cheaper of the two.
+const (
+	fifoScan         = 256
+	fifoScanPerGroup = 4
+)
+
+// fifoScanCap is the cap on the messages a step reads in queue order for
+// a FIFO source of groups groups.
+func fifoScanCap(groups int) int {
+	return max(fifoScan, fifoScanPerGroup*groups)
+}
+
+// fifoGroups walks the distinct groups of the FIFO queue ?1 through the
+// group index, one seek per group, as fifoHeads does.
+const fifoGroups = `
+WITH RECURSIVE grp(g) AS (
+	SELECT (SELECT group_id FROM messages WHERE queue_id = ?1 ORDER BY group_id LIMIT 1)
+	UNION ALL
+	SELECT (SELECT group_id FROM messages
+	        WHERE queue_id = ?1 AND group_id > grp.g ORDER BY group_id LIMIT 1)
+	FROM grp WHERE grp.g IS NOT NULL
+)`
+
+// fifoScanned reads, in queue order, up to ?4 of a FIFO source's visible
+// messages up to the row ?3, and selects the first ?5 of them a receive
+// could take, as takeFIFO holds them, so a task moves a group's messages in
+// their order: a group is held while any of its messages is in flight, and
+// a message that is not visible holds the messages behind it in its group.
+// It reads the source through its queue index, one message after another,
+// and stops once it has ?5, so a step costs the messages it read: for
+// each, a lookup of the message and, for the hold, a read of its group's
+// messages that are not visible. CROSS JOIN keeps the read the outer loop.
+const fifoScanned = `
+SELECT ` + messageColumns + ` FROM (
+	SELECT id AS rid, EXISTS (
+		SELECT 1 FROM messages x
+		WHERE x.queue_id = messages.queue_id AND x.group_id = messages.group_id
+		  AND x.visible_at > ?2 AND (x.receive_count > 0 OR x.id < messages.id)) AS held
+	FROM messages WHERE queue_id = ?1 AND id <= ?3 AND visible_at <= ?2
+	ORDER BY id LIMIT ?4) CROSS JOIN messages
+WHERE messages.id = rid AND NOT held ORDER BY rid LIMIT ?5`
+
+// fifoToMove selects, in queue order, up to ?4 of the messages up to the
+// row ?3 of a FIFO source that a receive could take, those fifoScanned
+// selects when its read is not capped. It walks every distinct group,
+// through fifoGroups, and for each one checks it has no message in flight
+// and finds its stop, its first message that is not visible, each by
+// reading the group's messages that are not visible. It reads at most ?4
+// messages of each group with nothing in flight, those before its stop,
+// which are all visible, and sorts them. Its cost so grows with the number
+// of groups and the messages that are not visible, not with a backlog of
+// visible messages behind a message in flight. ready is materialized so
+// each stop is sought once, and CROSS JOIN keeps the groups the outer loop.
+const fifoToMove = fifoGroups + `,
+ready AS MATERIALIZED (
+	SELECT g, (SELECT MIN(id) FROM messages x
+	           WHERE x.queue_id = ?1 AND x.group_id = grp.g AND x.visible_at > ?2) AS stop
+	FROM grp
+	WHERE g IS NOT NULL AND NOT EXISTS (
+		SELECT 1 FROM messages x
+		WHERE x.queue_id = ?1 AND x.group_id = grp.g AND x.visible_at > ?2
+		  AND x.receive_count > 0)
+)
+SELECT ` + messageColumns + ` FROM ready CROSS JOIN messages
+WHERE messages.id IN (
+	SELECT m.id FROM messages m
+	WHERE m.queue_id = ?1 AND m.group_id = ready.g AND m.id <= ?3
+	  AND (ready.stop IS NULL OR m.id < ready.stop)
+	ORDER BY m.id LIMIT ?4)
+ORDER BY messages.id LIMIT ?4`
 
 // toMove returns up to n of the visible messages up to the task t's last
 // row, oldest first, of its source queue, whose expired messages it
 // deletes first, and the queue, nil when it is gone. Of a FIFO queue it
-// returns only those heldFIFO keeps.
+// returns only those toMoveFIFO selects.
 func toMove(ctx context.Context, tx *sql.Tx, t *moveTaskRow, n int, now time.Time) (
 	[]*messageRow, *queueRow, error,
 ) {
@@ -607,14 +689,47 @@ func toMove(ctx context.Context, tx *sql.Tx, t *moveTaskRow, n int, now time.Tim
 	if err = expire(ctx, tx, q, set, now); err != nil {
 		return nil, nil, err
 	}
+	if q.fifo {
+		msgs, fErr := toMoveFIFO(ctx, tx, q, t, n, now)
+		return msgs, q, fErr
+	}
 	query := `SELECT ` + messageColumns + ` FROM messages
 		WHERE queue_id = ?1 AND id <= ?3 AND visible_at <= ?2`
-	if q.fifo {
-		query += heldFIFO
-	}
 	msgs, err := queryAll(ctx, tx, scanMessage, query+` ORDER BY id LIMIT ?4`,
 		q.id, stamp(now), t.upTo, n)
 	return msgs, q, err
+}
+
+// toMoveFIFO returns up to n of the FIFO source q's visible messages up to
+// the task t's last row, oldest first, that a receive could take. It reads
+// the source in queue order, through fifoScanned, and stops once it has n;
+// only when the first fifoScanCap visible messages hold fewer than n it
+// could take does it walk the groups instead, through fifoToMove. It sets
+// the task's cap from a count of the source's groups when it has none yet.
+func toMoveFIFO(ctx context.Context, tx *sql.Tx, q *queueRow, t *moveTaskRow, n int,
+	now time.Time,
+) ([]*messageRow, error) {
+	if *t.scan == 0 {
+		var groups int
+		if _, err := scanOne(ctx, tx, []any{&groups},
+			fifoGroups+` SELECT COUNT(*) FROM grp WHERE g IS NOT NULL`, q.id); err != nil {
+			return nil, err
+		}
+		*t.scan = fifoScanCap(groups)
+	}
+	msgs, err := queryAll(ctx, tx, scanMessage, fifoScanned, q.id, stamp(now), t.upTo,
+		*t.scan, n)
+	if err != nil || len(msgs) == n {
+		return msgs, err
+	}
+	// Fewer than n are all there are unless the read reached the cap.
+	capped, err := scanOne(ctx, tx, []any{new(int)},
+		`SELECT 1 FROM messages WHERE queue_id = ? AND id <= ? AND visible_at <= ?
+		 ORDER BY id LIMIT 1 OFFSET ?`, q.id, t.upTo, stamp(now), *t.scan-1)
+	if err != nil || !capped {
+		return msgs, err
+	}
+	return queryAll(ctx, tx, scanMessage, fifoToMove, q.id, stamp(now), t.upTo, n)
 }
 
 // afterLast is the status of a running task t whose step moved every
@@ -633,7 +748,7 @@ func afterLast(ctx context.Context, tx *sql.Tx, q *queueRow, t *moveTaskRow, st 
 
 // heldBack reports whether a FIFO source still has visible messages up to
 // the task t's last row once a step moved every message it could: messages
-// of groups heldFIFO holds, which the task waits for rather than leaves.
+// of groups fifoScanned tells are held, which the task waits for rather than leaves.
 func heldBack(ctx context.Context, tx *sql.Tx, q *queueRow, t *moveTaskRow, now time.Time) (
 	bool, error,
 ) {

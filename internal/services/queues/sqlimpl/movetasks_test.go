@@ -2,8 +2,11 @@ package sqlimpl
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"slices"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -370,6 +373,84 @@ func TestAMoveTaskHoldsAFIFOGroupWithAMessageInFlight(t *testing.T) {
 	requireBodies(t, receive(t, s, "dest.fifo", 10), "free", "held-1", "held-2")
 }
 
+func TestAMoveTaskReachesAGroupBehindALongHeldBacklog(t *testing.T) {
+	s, c := newStore(t)
+	createQueue(t, s, "dlq.fifo", true, nil)
+	createQueue(t, s, "src.fifo", true, map[string]string{
+		"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq.fifo",` +
+			`"maxReceiveCount":1}`,
+	})
+	createQueue(t, s, "dest.fifo", true, nil)
+	// More of the held group than a step reads in queue order, so the step
+	// walks the groups to find the free one behind them.
+	backlog := fifoScan + 5
+	for i := 0; i < backlog; i += 100 {
+		batch := make([]contracts.SendInput, 0, 100)
+		for j := i; j < min(i+100, backlog); j++ {
+			batch = append(batch, fifoMsg("held-"+strconv.Itoa(j), "held"))
+		}
+		send(t, s, "dlq.fifo", batch...)
+	}
+	send(t, s, "dlq.fifo", fifoMsg("free-1", "free"), fifoMsg("free-2", "free"))
+	if _, err := s.ReceiveMessages(t.Context(), "dlq.fifo", contracts.ReceiveInput{
+		Max: 1, VisibilityTimeout: intp(30),
+	}); err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+
+	startMove(t, s, "dlq.fifo", "dest.fifo", 0)
+	waitMoved(t, s, "dlq.fifo", 2)
+	time.Sleep(3 * heldPause)
+	tasks, err := s.ListMoveTasks(t.Context(), "dlq.fifo", 1)
+	if err != nil || tasks[0].Status != contracts.MoveTaskRunning || tasks[0].Moved != 2 {
+		t.Fatalf("task while a group is held = %+v, %v, want running with 2 moved", tasks, err)
+	}
+
+	c.advance(31 * time.Second)
+	if done := waitMove(t, s, "dlq.fifo"); done.Status != contracts.MoveTaskCompleted ||
+		done.Moved != int64(backlog+2) {
+		t.Fatalf("ended task = %+v, want all %d moved", done, backlog+2)
+	}
+	got := receive(t, s, "dest.fifo", 10)
+	requireBodies(t, got[:3], "free-1", "free-2", "held-0")
+}
+
+func TestAFIFOMoveStepsScanCapFollowsTheGroups(t *testing.T) {
+	for _, tt := range []struct {
+		groups int
+		want   int
+	}{
+		{groups: 10, want: fifoScan},
+		{groups: 300, want: 300 * fifoScanPerGroup},
+	} {
+		s, _ := newStore(t)
+		createQueue(t, s, "q.fifo", true, nil)
+		for g := 0; g < tt.groups; g += 100 {
+			batch := make([]contracts.SendInput, 0, 100)
+			for i := g; i < min(g+100, tt.groups); i++ {
+				batch = append(batch, fifoMsg("m"+strconv.Itoa(i), "g"+strconv.Itoa(i)))
+			}
+			send(t, s, "q.fifo", batch...)
+		}
+		scan := 0
+		if err := s.inTx(t.Context(), func(tx *sql.Tx) error {
+			q, err := loadQueue(t.Context(), tx, "q.fifo")
+			if err != nil {
+				return err
+			}
+			_, _, err = toMove(t.Context(), tx, &moveTaskRow{
+				queueID: q.id, upTo: 1 << 40, scan: &scan,
+			}, moveBatch+1, s.now())
+			return err
+		}); err != nil {
+			t.Fatalf("a step on %d groups: %v", tt.groups, err)
+		}
+		if scan != tt.want {
+			t.Errorf("scan cap on %d groups = %d, want %d", tt.groups, scan, tt.want)
+		}
+	}
+}
+
 // waitMoved waits for the latest task of source to have moved n messages.
 func waitMoved(t *testing.T, s *Service, source string, n int64) {
 	t.Helper()
@@ -386,5 +467,114 @@ func waitMoved(t *testing.T, s *Service, source string, n int64) {
 			t.Fatalf("the task on %s did not move %d: %+v", source, n, tasks[0])
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAMoveTaskHoldsAFIFOGroupBehindADelayedMessage(t *testing.T) {
+	s, c := newStore(t)
+	createQueue(t, s, "dlq.fifo", true, nil)
+	createQueue(t, s, "src.fifo", true, map[string]string{
+		"RedrivePolicy": `{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:000000000000:dlq.fifo",` +
+			`"maxReceiveCount":1}`,
+	})
+	createQueue(t, s, "dest.fifo", true, nil)
+	delay := func(secs string) {
+		t.Helper()
+		if err := s.SetQueueAttributes(t.Context(), "dlq.fifo",
+			map[string]string{"DelaySeconds": secs}); err != nil {
+			t.Fatalf("set DelaySeconds %s: %v", secs, err)
+		}
+	}
+	// held-1 is delayed, which holds held-2 behind it; free-2, delayed
+	// behind free-1, holds nothing before it.
+	delay("60")
+	send(t, s, "dlq.fifo", fifoMsg("held-1", "held"))
+	delay("0")
+	send(t, s, "dlq.fifo", fifoMsg("held-2", "held"), fifoMsg("free-1", "free"))
+	delay("60")
+	send(t, s, "dlq.fifo", fifoMsg("free-2", "free"))
+
+	startMove(t, s, "dlq.fifo", "dest.fifo", 0)
+	waitMoved(t, s, "dlq.fifo", 1)
+	// Two steps later the held group is still held, and the task waits.
+	time.Sleep(3 * heldPause)
+	tasks, err := s.ListMoveTasks(t.Context(), "dlq.fifo", 1)
+	if err != nil || tasks[0].Status != contracts.MoveTaskRunning || tasks[0].Moved != 1 {
+		t.Fatalf("task while a group is held = %+v, %v, want running with 1 moved", tasks, err)
+	}
+
+	// Once the delays end, the held group moves in its order.
+	c.advance(61 * time.Second)
+	if done := waitMove(t, s, "dlq.fifo"); done.Status != contracts.MoveTaskCompleted ||
+		done.Moved != 4 {
+		t.Fatalf("ended task = %+v, want all 4 moved", done)
+	}
+	requireBodies(t, receive(t, s, "dest.fifo", 10), "free-1", "free-2", "held-1", "held-2")
+}
+
+// stuck launches on s a task that ignores its lifetime and runs until
+// released, and returns the channel that releases it and the one closed
+// once it returned.
+func stuck(t *testing.T, s *Service, id int64) (chan<- struct{}, <-chan struct{}) {
+	t.Helper()
+	tk, err := s.movers.claim()
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	release, ended := make(chan struct{}), make(chan struct{})
+	s.movers.launch(tk, id, func(context.Context, <-chan struct{}) {
+		defer close(ended)
+		<-release
+	})
+	return release, ended
+}
+
+func TestARestartAfterATimedOutCloseKeepsItsOwnTasks(t *testing.T) {
+	s, _ := newStore(t)
+	createQueue(t, s, "dlq", false, nil)
+	createQueue(t, s, "src", false, toDLQ())
+	// Two tasks of the first run outlive its Close: one ends while the next
+	// run claims places, one outlives the next run's Close too.
+	releaseA, endedA := stuck(t, s, -1)
+	releaseB, endedB := stuck(t, s, -2)
+	t.Cleanup(func() {
+		close(releaseB)
+		<-endedB
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close with tasks that do not stop = %v, want its deadline", err)
+	}
+
+	// gas's RestartService calls Init again on the same instance.
+	if err := s.Init(t.Context()); err != nil {
+		t.Fatalf("init again: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 1000 {
+			tk, err := s.movers.claim()
+			if err != nil {
+				t.Errorf("claim: %v", err)
+				return
+			}
+			s.movers.release(tk)
+		}
+	})
+	close(releaseA)
+	<-endedA
+	wg.Wait()
+	send(t, s, "dlq", contracts.SendInput{Body: "m"})
+	startMove(t, s, "dlq", "src", 0)
+	if done := waitMove(t, s, "dlq"); done.Status != contracts.MoveTaskCompleted {
+		t.Fatalf("a task after the restart = %+v, want completed", done)
+	}
+
+	// The restarted run waits for its own tasks only.
+	ctx, cancel = context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := s.Close(ctx); err != nil {
+		t.Fatalf("close the restarted run = %v, want its tasks stopped", err)
 	}
 }
