@@ -214,6 +214,7 @@ func TestErrorShapesAreTheSDKs(t *testing.T) {
 		&types.InvalidAddress{}, &types.OverLimit{}, &types.EmptyBatchRequest{},
 		&types.TooManyEntriesInBatchRequest{}, &types.BatchEntryIdsNotDistinct{},
 		&types.InvalidBatchEntryId{}, &types.BatchRequestTooLong{}, &types.UnsupportedOperation{},
+		&types.ResourceNotFoundException{},
 	}
 	names := map[string]bool{}
 	for _, e := range modeled {
@@ -225,7 +226,7 @@ func TestErrorShapesAreTheSDKs(t *testing.T) {
 		shapeInvalidAttributeName, shapeInvalidAttributeValue, shapeInvalidMessageContents,
 		shapeInvalidAddress, shapeOverLimit, shapeEmptyBatch, shapeTooManyEntries,
 		shapeIDsNotDistinct, shapeInvalidBatchEntryID, shapeBatchTooLong,
-		shapeUnsupportedOperation,
+		shapeUnsupportedOperation, shapeResourceNotFound,
 	}
 	for _, s := range shapes {
 		if !names[s.name] {
@@ -509,5 +510,85 @@ func TestARepeatedQueryParameterReadsItsFirstValue(t *testing.T) {
 			req.Tags["env"] != "dev" {
 			t.Fatalf("tags = %v, %v, want env=dev", req.Tags, err)
 		}
+	}
+}
+
+func TestQueryDecodesTheMoveTaskRequests(t *testing.T) {
+	p := Params(url.Values{
+		"SourceArn":                    {"arn:aws:sqs:us-east-1:000000000000:dlq"},
+		"DestinationArn":               {"arn:aws:sqs:us-east-1:000000000000:src"},
+		"MaxNumberOfMessagesPerSecond": {"10"},
+		"MaxResults":                   {"5"},
+		"TaskHandle":                   {"h"},
+	})
+	var start StartMessageMoveTaskRequest
+	if err := p.Decode(&start); err != nil || *start.SourceARN != p["SourceArn"][0] ||
+		*start.DestinationARN != p["DestinationArn"][0] ||
+		*start.MaxNumberOfMessagesPerSecond != 10 {
+		t.Fatalf("start = %+v, %v", start, err)
+	}
+	var list ListMessageMoveTasksRequest
+	if err := p.Decode(&list); err != nil || *list.SourceARN != p["SourceArn"][0] ||
+		*list.MaxResults != 5 {
+		t.Fatalf("list = %+v, %v", list, err)
+	}
+	var cancel CancelMessageMoveTaskRequest
+	if err := p.Decode(&cancel); err != nil || *cancel.TaskHandle != "h" {
+		t.Fatalf("cancel = %+v, %v", cancel, err)
+	}
+}
+
+// The SDK model's names for a ListMessageMoveTasks result: a flattened
+// list of ListMessageMoveTasksResultEntry, and an entry without the members
+// a task does not have.
+func TestQueryWritesTheMoveTaskList(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/", http.NoBody)
+	w := httptest.NewRecorder()
+	toMove := int64(2)
+	Write(w, r, Query, "ListMessageMoveTasks", ListMessageMoveTasksResult{
+		Results: []ListMessageMoveTasksResultEntry{{
+			Status: "COMPLETED", SourceARN: "arn:dlq", ApproximateNumberOfMessagesMoved: 2,
+			ApproximateNumberOfMessagesToMove: &toMove, StartedTimestamp: 1684429053010,
+		}},
+	})
+	want := `<ListMessageMoveTasksResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">` +
+		`<ListMessageMoveTasksResult><ListMessageMoveTasksResultEntry>` +
+		`<ApproximateNumberOfMessagesToMove>2</ApproximateNumberOfMessagesToMove>` +
+		`<Status>COMPLETED</Status><SourceArn>arn:dlq</SourceArn>` +
+		`<ApproximateNumberOfMessagesMoved>2</ApproximateNumberOfMessagesMoved>` +
+		`<StartedTimestamp>1684429053010</StartedTimestamp>` +
+		`</ListMessageMoveTasksResultEntry></ListMessageMoveTasksResult>` +
+		`<ResponseMetadata><RequestId></RequestId></ResponseMetadata>` +
+		`</ListMessageMoveTasksResponse>`
+	if got := w.Body.String(); got != want {
+		t.Fatalf("document =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestMoveTaskChecks(t *testing.T) {
+	for _, v := range []int{0, 501} {
+		if err := CheckMoveRate(&v); err == nil {
+			t.Errorf("rate %d passed", v)
+		}
+	}
+	if err := CheckMoveRate(new(500)); err != nil {
+		t.Errorf("rate 500: %v", err)
+	}
+	if n, err := CheckMoveTaskResults(nil); n != 1 || err != nil {
+		t.Errorf("default MaxResults = %d, %v, want 1", n, err)
+	}
+	if _, err := CheckMoveTaskResults(new(11)); err == nil {
+		t.Error("MaxResults 11 passed")
+	}
+	for _, arn := range []string{
+		"dlq", "arn:aws:sns:us-east-1:000000000000:t",
+		"arn:aws:sqs:us-east-1:000000000000:", "arn:aws:sqs::000000000000:dlq",
+	} {
+		if err := CheckQueueARN("SourceArn", arn); err == nil {
+			t.Errorf("%q passed as a queue ARN", arn)
+		}
+	}
+	if err := CheckQueueARN("SourceArn", "arn:aws:sqs:eu-west-1:111122223333:a"); err != nil {
+		t.Errorf("an ARN of another region and account: %v", err)
 	}
 }

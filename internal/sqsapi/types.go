@@ -406,3 +406,55 @@ func stringToken(dec *json.Decoder) (string, error) {
 	}
 	return s, nil
 }
+
+// StartMessageMoveTaskRequest is the input of StartMessageMoveTask.
+type StartMessageMoveTaskRequest struct {
+	MaxNumberOfMessagesPerSecond *int    `json:"MaxNumberOfMessagesPerSecond"`
+	SourceARN                    *string `json:"SourceArn"`
+	DestinationARN               *string `json:"DestinationArn"`
+}
+
+// StartMessageMoveTaskResult is the result of StartMessageMoveTask.
+type StartMessageMoveTaskResult struct {
+	TaskHandle string `json:"TaskHandle" xml:"TaskHandle"`
+}
+
+// ListMessageMoveTasksRequest is the input of ListMessageMoveTasks.
+type ListMessageMoveTasksRequest struct {
+	MaxResults *int    `json:"MaxResults"`
+	SourceARN  *string `json:"SourceArn"`
+}
+
+// ListMessageMoveTasksResultEntry is one task ListMessageMoveTasks
+// reports. The model gives every member but the two counts and
+// StartedTimestamp as optional: TaskHandle only for a running task,
+// DestinationArn and MaxNumberOfMessagesPerSecond only when the task was
+// started with them, FailureReason only for a failed task.
+type ListMessageMoveTasksResultEntry struct {
+	MaxNumberOfMessagesPerSecond      *int   `json:"MaxNumberOfMessagesPerSecond,omitempty"      xml:"MaxNumberOfMessagesPerSecond,omitempty"`
+	ApproximateNumberOfMessagesToMove *int64 `json:"ApproximateNumberOfMessagesToMove,omitempty" xml:"ApproximateNumberOfMessagesToMove,omitempty"`
+	TaskHandle                        string `json:"TaskHandle,omitempty"                        xml:"TaskHandle,omitempty"`
+	Status                            string `json:"Status"                                      xml:"Status"`
+	SourceARN                         string `json:"SourceArn"                                   xml:"SourceArn"`
+	DestinationARN                    string `json:"DestinationArn,omitempty"                    xml:"DestinationArn,omitempty"`
+	FailureReason                     string `json:"FailureReason,omitempty"                     xml:"FailureReason,omitempty"`
+	ApproximateNumberOfMessagesMoved  int64  `json:"ApproximateNumberOfMessagesMoved"            xml:"ApproximateNumberOfMessagesMoved"`
+	StartedTimestamp                  int64  `json:"StartedTimestamp"                            xml:"StartedTimestamp"`
+}
+
+// ListMessageMoveTasksResult is the result of ListMessageMoveTasks. The
+// model gives the list the xmlName ListMessageMoveTasksResultEntry,
+// flattened; the API reference's Query example shows Result elements.
+type ListMessageMoveTasksResult struct {
+	Results []ListMessageMoveTasksResultEntry `json:"Results,omitempty" xml:"ListMessageMoveTasksResultEntry"`
+}
+
+// CancelMessageMoveTaskRequest is the input of CancelMessageMoveTask.
+type CancelMessageMoveTaskRequest struct {
+	TaskHandle *string `json:"TaskHandle"`
+}
+
+// CancelMessageMoveTaskResult is the result of CancelMessageMoveTask.
+type CancelMessageMoveTaskResult struct {
+	ApproximateNumberOfMessagesMoved int64 `json:"ApproximateNumberOfMessagesMoved" xml:"ApproximateNumberOfMessagesMoved"`
+}

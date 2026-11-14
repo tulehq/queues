@@ -95,10 +95,11 @@ func TestEveryEntryIsTheReferencesAction(t *testing.T) {
 			t.Errorf("%s: resources %v, but the entry evaluates on \"*\": %v", op, res, gotAny)
 		}
 		// Any further action the reference lists must be one the entry
-		// checks too: CreateQueue's sqs:TagQueue, when it tags.
+		// checks too: CreateQueue's sqs:TagQueue, when it tags, the
+		// actions an entry also checks on its queue, and
+		// StartMessageMoveTask's sqs:SendMessage on the queues it sends to.
 		for _, extra := range authorized[op] {
-			alsoChecked := op == "CreateQueue" && extra == tagQueueAction
-			if extra != a.action && !alsoChecked {
+			if extra != a.action && !alsoChecked(op, a, extra) {
 				t.Errorf("%s: the reference also authorizes it as %s, which is not checked",
 					op, extra)
 			}
@@ -106,14 +107,22 @@ func TestEveryEntryIsTheReferencesAction(t *testing.T) {
 	}
 }
 
+// alsoChecked reports whether the entry a of op checks extra beside its
+// action.
+func alsoChecked(op string, a access, extra string) bool {
+	return op == "CreateQueue" && extra == tagQueueAction ||
+		slices.Contains(a.also, extra) ||
+		op == "StartMessageMoveTask" && extra == sendMessageAction
+}
+
 func TestTheOwnerOnlyOperationsAreRouted(t *testing.T) {
 	// SQS Developer Guide, "Basic examples of Amazon SQS policies",
 	// Example 4: the routed operations cross-account permissions don't
-	// apply to. CancelMessageMoveTask, ListMessageMoveTasks and
-	// StartMessageMoveTask are on that list but not served.
+	// apply to.
 	want := []string{
-		"AddPermission", "CreateQueue", "DeleteQueue", "ListQueues", "ListQueueTags",
-		"RemovePermission", "SetQueueAttributes", "TagQueue", "UntagQueue",
+		"AddPermission", "CancelMessageMoveTask", "CreateQueue", "DeleteQueue",
+		"ListMessageMoveTasks", "ListQueues", "ListQueueTags", "RemovePermission",
+		"SetQueueAttributes", "StartMessageMoveTask", "TagQueue", "UntagQueue",
 	}
 	if len(ownerOnly) != len(want) {
 		t.Fatalf("ownerOnly has %d operations, want %d", len(ownerOnly), len(want))

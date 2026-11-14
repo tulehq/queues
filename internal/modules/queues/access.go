@@ -23,6 +23,15 @@ import (
 // and is evaluated on "*". The batch operations are their base actions on
 // their one queue, so a batch is allowed or denied whole: every entry names
 // the same queue, and SQS has no per-entry AccessDenied.
+//
+// The message move task operations are authorized as the reference's
+// Operations list them, which the developer guide's "Configuring queue
+// permissions for dead-letter queue redrive" gives as the minimum
+// permissions: StartMessageMoveTask as itself, sqs:ReceiveMessage,
+// sqs:DeleteMessage and sqs:GetQueueAttributes on the source queue and
+// sqs:SendMessage on the destination; CancelMessageMoveTask as itself and
+// the same three on the source; ListMessageMoveTasks as itself and
+// sqs:GetQueueAttributes.
 var operationAccess = map[string]access{
 	"AddPermission": {
 		action: "sqs:AddPermission",
@@ -35,6 +44,10 @@ var operationAccess = map[string]access{
 	"ChangeMessageVisibilityBatch": {
 		action: "sqs:ChangeMessageVisibility",
 		target: byQueueURL[sqsapi.ChangeMessageVisibilityBatchRequest],
+	},
+	"CancelMessageMoveTask": {
+		action: "sqs:CancelMessageMoveTask", also: moveSourceActions,
+		target: cancelMoveTarget,
 	},
 	"CreateQueue": {action: "sqs:CreateQueue", target: createQueueTarget},
 	"DeleteMessage": {
@@ -62,6 +75,10 @@ var operationAccess = map[string]access{
 		action: "sqs:ListQueueTags",
 		target: byQueueURL[sqsapi.QueueRequest],
 	},
+	"ListMessageMoveTasks": {
+		action: "sqs:ListMessageMoveTasks", also: []string{"sqs:GetQueueAttributes"},
+		target: listMoveTarget,
+	},
 	"ListQueues": {action: "sqs:ListQueues", target: anyResource},
 	"PurgeQueue": {
 		action: "sqs:PurgeQueue",
@@ -87,6 +104,10 @@ var operationAccess = map[string]access{
 		action: "sqs:SetQueueAttributes",
 		target: byQueueURL[sqsapi.SetQueueAttributesRequest],
 	},
+	"StartMessageMoveTask": {
+		action: "sqs:StartMessageMoveTask", also: moveSourceActions,
+		target: startMoveTarget,
+	},
 	"TagQueue":   {action: "sqs:TagQueue", target: tagQueueTarget},
 	"UntagQueue": {action: "sqs:UntagQueue", target: untagQueueTarget},
 }
@@ -98,10 +119,21 @@ var operationAccess = map[string]access{
 // account is evaluated on them with the queue's policy, so a Deny in it
 // applies, but nothing grants them to it (authz.Check.Unshared).
 var ownerOnly = map[string]bool{
-	"AddPermission": true, "CreateQueue": true, "DeleteQueue": true, "ListQueues": true,
+	"AddPermission": true, "CancelMessageMoveTask": true, "CreateQueue": true,
+	"DeleteQueue": true, "ListMessageMoveTasks": true, "ListQueues": true,
 	"ListQueueTags": true, "RemovePermission": true, "SetQueueAttributes": true,
-	"TagQueue": true, "UntagQueue": true,
+	"StartMessageMoveTask": true, "TagQueue": true, "UntagQueue": true,
 }
+
+// moveSourceActions are the actions a move task's start and cancel also
+// need on its source queue.
+var moveSourceActions = []string{
+	"sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes",
+}
+
+// sendMessageAction is the action a move task's start needs on each queue
+// it moves messages to.
+const sendMessageAction = "sqs:SendMessage"
 
 // tagQueueAction is the action CreateQueue also needs when it tags the
 // queue it creates: "To be able to tag a queue on creation, you must have
@@ -113,11 +145,13 @@ const tagQueueAction = "sqs:TagQueue"
 // quotas), which bounds the aws:TagKeys values of an UntagQueue.
 const maxTagKeyLen = 128
 
-// access is one operation's entry: its action, and how to find the
-// resource and the request's own context keys.
+// access is one operation's entry: its action, the actions it also needs
+// on the same resource, and how to find the resource and the request's own
+// context keys.
 type access struct {
 	target func(*Module, *call) (accessTarget, error)
 	action string
+	also   []string
 }
 
 // accessTarget is what one request acts on.
@@ -125,6 +159,11 @@ type accessTarget struct {
 	// context holds the request's own keys: aws:RequestTag/<key> and
 	// aws:TagKeys.
 	context map[string][]string
+	// sendTo returns the queues the request also sends messages to, each
+	// evaluated for sqs:SendMessage on its own ARN, tags and policy. It is
+	// called once the request is pinned to its queue, so what it reads of
+	// that queue is of the queue evaluated.
+	sendTo func(*call) ([]string, error)
 	// queue is the queue the request names, or "" for "*".
 	queue string
 	// tagKeys are the keys a TagQueue adds, checked against the stored
@@ -163,14 +202,12 @@ func (m *Module) authorize(c *call) error {
 	if err != nil {
 		return err
 	}
-	check := authz.Check{
+	checks, err := m.checks(c, a, t, authz.Check{
 		Action: a.action, Resource: resource, Context: ctx, Policy: pol,
 		Unshared: ownerOnly[c.op],
-	}
-	checks := []authz.Check{check}
-	if t.alsoTag {
-		check.Action = tagQueueAction
-		checks = append(checks, check)
+	})
+	if err != nil {
+		return err
 	}
 	return m.authorizer.Authorize(
 		c.Request(),
@@ -264,6 +301,56 @@ func (m *Module) readQueue(
 	return out, q.Policy, nil
 }
 
+// checks returns every check a request on t needs: check, its operation's
+// action on the queue; the other actions a needs on the same queue; the
+// sends to the queues t sends to; and, for a CreateQueue that tags its
+// queue, sqs:TagQueue.
+func (m *Module) checks(c *call, a access, t accessTarget, check authz.Check) (
+	[]authz.Check, error,
+) {
+	checks := []authz.Check{check}
+	for _, action := range a.also {
+		also := check
+		also.Action, also.Unshared = action, false
+		checks = append(checks, also)
+	}
+	if t.sendTo != nil {
+		sends, err := m.sendChecks(c, t)
+		if err != nil {
+			return nil, err
+		}
+		checks = append(checks, sends...)
+	}
+	if t.alsoTag {
+		check.Action = tagQueueAction
+		checks = append(checks, check)
+	}
+	return checks, nil
+}
+
+// sendChecks returns the sqs:SendMessage check of each queue t sends to,
+// on the queue's ARN, tags and policy. The request stays pinned to the
+// queue it acts on.
+func (m *Module) sendChecks(c *call, t accessTarget) ([]authz.Check, error) {
+	names, err := t.sendTo(c)
+	if err != nil {
+		return nil, err
+	}
+	pinned := c.pinned
+	defer func() { c.pinned = pinned }()
+	checks := make([]authz.Check, 0, len(names))
+	for _, name := range names {
+		resource, ctx, pol, fErr := m.facts(c, accessTarget{queue: name, exists: true})
+		if fErr != nil {
+			return nil, fErr
+		}
+		checks = append(checks, authz.Check{
+			Action: sendMessageAction, Resource: resource, Context: ctx, Policy: pol,
+		})
+	}
+	return checks, nil
+}
+
 // queueRequest is a request of type T that names its queue by QueueUrl.
 type queueRequest[T any] interface {
 	*T
@@ -304,6 +391,60 @@ func getQueueURLTarget(m *Module, c *call) (accessTarget, error) {
 		return accessTarget{}, err //nolint:wrapcheck // an *sqsapi.Error
 	}
 	return accessTarget{queue: name, exists: true}, nil
+}
+
+// startMoveTarget is a StartMessageMoveTask's source queue, which also
+// sends to its destination or, without one, to each queue the messages it
+// would move came from.
+func startMoveTarget(m *Module, c *call) (accessTarget, error) {
+	req, err := decoded[sqsapi.StartMessageMoveTaskRequest](c)
+	if err != nil {
+		return accessTarget{}, err
+	}
+	source, err := m.queueOfARN("SourceArn", req.SourceARN)
+	if err != nil {
+		return accessTarget{}, err
+	}
+	destination, err := m.destinationOf(req)
+	if err != nil {
+		return accessTarget{}, err
+	}
+	t := accessTarget{queue: source, exists: true}
+	t.sendTo = func(c *call) ([]string, error) {
+		if destination != "" {
+			return []string{destination}, nil
+		}
+		scope, sErr := m.moveScope(c, source)
+		if errors.Is(sErr, contracts.ErrQueueNotFound) {
+			// The operation fails as it would have, once allowed.
+			return nil, nil
+		}
+		if sErr != nil {
+			return nil, sErr
+		}
+		return scope.Origins, nil
+	}
+	return t, nil
+}
+
+func listMoveTarget(m *Module, c *call) (accessTarget, error) {
+	req, err := decoded[sqsapi.ListMessageMoveTasksRequest](c)
+	if err != nil {
+		return accessTarget{}, err
+	}
+	source, err := m.queueOfARN("SourceArn", req.SourceARN)
+	return accessTarget{queue: source, exists: true}, err
+}
+
+// cancelMoveTarget is the source queue a CancelMessageMoveTask's handle
+// names.
+func cancelMoveTarget(m *Module, c *call) (accessTarget, error) {
+	req, err := decoded[sqsapi.CancelMessageMoveTaskRequest](c)
+	if err != nil {
+		return accessTarget{}, err
+	}
+	source, _, err := m.taskSource(req.TaskHandle)
+	return accessTarget{queue: source, exists: true}, err
 }
 
 func createQueueTarget(_ *Module, c *call) (accessTarget, error) {

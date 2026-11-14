@@ -54,7 +54,10 @@ type call struct {
 	// evaluated pinned, or nil when it pinned none.
 	pinned context.Context //nolint:containedctx // the call is the request's context
 	// req is the request's parameters, decoded once (decoded).
-	req    any
+	req any
+	// scope is what a StartMessageMoveTask would move, read once
+	// (moveScope).
+	scope  *contracts.MoveScope
 	params sqsapi.Params
 	// pathQueue is the queue the URL path names, for a Query request sent
 	// to a queue URL.
@@ -107,6 +110,9 @@ func NewModule(settings *contracts.QueueSettings, authorizer *authz.Authorizer,
 			"DeleteMessageBatch":           m.deleteMessageBatch,
 			"ChangeMessageVisibility":      m.changeMessageVisibility,
 			"ChangeMessageVisibilityBatch": m.changeMessageVisibilityBatch,
+			"StartMessageMoveTask":         m.startMessageMoveTask,
+			"ListMessageMoveTasks":         m.listMessageMoveTasks,
+			"CancelMessageMoveTask":        m.cancelMessageMoveTask,
 		}
 		return m
 	}

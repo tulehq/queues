@@ -153,7 +153,7 @@ func (s *Service) DeleteAll(ctx context.Context) error {
 		}
 		for _, table := range []string{
 			"messages", "queue_tags", "deduplication",
-			"receive_attempts", "deleted_queues", "queues",
+			"receive_attempts", "move_tasks", "deleted_queues", "queues",
 		} {
 			if err = exec(ctx, tx, `DELETE FROM `+table); err != nil {
 				return err

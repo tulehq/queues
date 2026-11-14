@@ -95,7 +95,9 @@ func TestAuthorizationAndTheOperationShareOneDecoding(t *testing.T) {
 	settings := &contracts.QueueSettings{AccountID: "000000000000", Region: "us-east-1"}
 	az := authz.New(settings.AccountID, settings.Region, time.Now)
 	m := NewModule(settings, az, nil)(nil, nil)
-	body := `{"QueueUrl":"http://queues.local/000000000000/orders","QueueName":"orders"}`
+	arn := settings.ARN("orders")
+	body := `{"QueueUrl":"http://queues.local/000000000000/orders","QueueName":"orders",` +
+		`"SourceArn":"` + arn + `","TaskHandle":"` + contracts.TaskHandle("t", arn) + `"}`
 
 	for op, a := range operationAccess {
 		r := httptest.NewRequest(http.MethodPost, "http://queues.local/", strings.NewReader(body))

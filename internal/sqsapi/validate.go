@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -25,6 +26,8 @@ const (
 	MaxWaitTimeSeconds     = 20
 	MaxReceiveMessages     = 10
 	MaxListResults         = 1000
+	MaxMoveRate            = 500
+	MaxMoveTasksListed     = 10
 	maxQueueNameLen        = 80
 	maxTagKeyLen           = 128
 	maxTagValueLen         = 256
@@ -506,6 +509,37 @@ func CheckMaxResults(v *int) (int, error) {
 		return 0, err
 	}
 	return *v, nil
+}
+
+// CheckMoveRate checks a StartMessageMoveTask's MaxNumberOfMessagesPerSecond,
+// 1 to 500: "The maximum value for messages per second is 500" (API
+// reference). nil asks for the system-optimized rate.
+func CheckMoveRate(v *int) error {
+	return checkRange("MaxNumberOfMessagesPerSecond", v, 1, MaxMoveRate)
+}
+
+// CheckMoveTaskResults checks a ListMessageMoveTasks's MaxResults, 1 to 10,
+// and returns it, or 1, the default, when the request sets none: "The
+// default is 1 [...]. The upper limit is 10" (API reference).
+func CheckMoveTaskResults(v *int) (int, error) {
+	if v == nil {
+		return 1, nil
+	}
+	if err := checkRange("MaxResults", v, 1, MaxMoveTasksListed); err != nil {
+		return 0, err
+	}
+	return *v, nil
+}
+
+// CheckQueueARN checks that a parameter is an SQS ARN in form,
+// arn:<partition>:sqs:<region>:<account>:<name>, whichever queue it names.
+func CheckQueueARN(field, arn string) error {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) != 6 || parts[0] != "arn" || parts[2] != "sqs" ||
+		slices.Contains(parts, "") {
+		return errInvalidValue(field, arn, "Must be an Amazon SQS queue ARN")
+	}
+	return nil
 }
 
 // CheckTags checks tags as the developer guide's tag quotas give them: keys

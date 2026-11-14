@@ -329,7 +329,9 @@ func (s *Service) QueueInfo(ctx context.Context, name string) (*contracts.Queue,
 
 // deleteQueueRows deletes the queue's rows in every table.
 func deleteQueueRows(ctx context.Context, tx *sql.Tx, queueID int64) error {
-	for _, table := range []string{"messages", "queue_tags", "deduplication", "receive_attempts"} {
+	for _, table := range []string{
+		"messages", "queue_tags", "deduplication", "receive_attempts", "move_tasks",
+	} {
 		if err := exec(ctx, tx, `DELETE FROM `+table+` WHERE queue_id = ?`, queueID); err != nil {
 			return err
 		}
