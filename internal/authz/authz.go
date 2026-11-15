@@ -42,6 +42,13 @@ const maxPolicySize = 64 << 10
 // more before evaluating it. 50 is SQS's tag quota per queue.
 const MaxContextValues = 50
 
+// MaxValueLength bounds a condition value a caller supplies, such as the
+// service-send endpoint's aws:SourceArn: tule.dev/policy's cost grows with
+// the context's size, so the caller refuses a longer value before
+// evaluating it. An ARN may be 2048 characters; 1024 holds every ARN Tule
+// makes.
+const MaxValueLength = 1024
+
 // policyKind tells the cache's identity policies from its resource
 // policies, which parse under different rules.
 type policyKind byte
@@ -170,6 +177,46 @@ func (a *Authorizer) Authorize(r *http.Request, p sigv4.Principal, checks ...Che
 		}
 	}
 	return nil
+}
+
+// AuthorizeService returns nil when c.Policy allows the AWS service
+// principal service c.Action on c.Resource, and a *Denied otherwise, whose
+// Principal is service. r is the request of the Tule service that calls
+// as service.
+//
+// Only the queue's policy is evaluated, with tule.dev/policy's
+// AuthorizeService: a service principal has no identity policies, and a
+// queue without a policy, or one whose policy names no such service, does
+// not allow it. A Deny in the policy applies. c.Unshared does not apply: a
+// service principal is of no account. The context is c.Context and four
+// of the keys the IAM User Guide ("AWS global condition context keys")
+// documents as always in the request context: aws:CurrentTime,
+// aws:EpochTime, aws:SecureTransport and aws:RequestedRegion, the
+// service's own region, as Context gives them. aws:PrincipalServiceName
+// and aws:PrincipalIsAWSService come from tule.dev/policy. aws:SourceIp is
+// not supplied: the address is that of the Tule service, not of AWS's
+// service, and "certain network-specific authorization context is
+// redacted" on service-to-service calls (the same page, aws:SourceIp).
+func (a *Authorizer) AuthorizeService(r *http.Request, service string, c Check) error {
+	now := a.now().UTC()
+	ctx := map[string][]string{
+		"aws:CurrentTime":     {now.Format("2006-01-02T15:04:05Z")},
+		"aws:EpochTime":       {strconv.FormatInt(now.Unix(), 10)},
+		"aws:SecureTransport": {strconv.FormatBool(r.TLS != nil)},
+		"aws:RequestedRegion": {a.region},
+	}
+	maps.Copy(ctx, c.Context)
+	az := policy.AuthorizeService(policy.ServiceRequest{
+		Action: c.Action, Resource: c.Resource, Service: service, Context: ctx,
+	}, c.Policy)
+	switch {
+	case az.Decision == policy.Allow:
+		return nil
+	case az.Reason == policy.NoReason:
+		return fmt.Errorf("authz: %s on %s by %s denied (%v) without a reason",
+			c.Action, c.Resource, service, az.Decision)
+	}
+	return &Denied{Principal: service, Action: c.Action, Resource: c.Resource, Reason: az.Reason}
 }
 
 // check decides one check of p, with the base context and p's parsed

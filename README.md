@@ -85,7 +85,9 @@ Logs go to the console only; there is no log shipping.
 
 Standalone, without `TULE_Auth_IdentityEndpoint`, nothing is evaluated: the
 configured key is the account's root user and may call every operation and
-the inspection API.
+the inspection API. The one exception is the
+[service send endpoint](#the-service-send-endpoint), which evaluates the
+queue's policy for the service principal it sends as, standalone too.
 
 With an identity endpoint, the configured key, which is identity's root key
 too, is still never evaluated, as AWS never evaluates the root user. Only the
@@ -220,6 +222,10 @@ user or role the policy it needs, such as `sqs:*` on `*`.
 
 **Changes in v0.6.0.**
 
+- **The service send endpoint is served**
+  ([The service send endpoint](#the-service-send-endpoint)): a Tule
+  service, such as object-store delivering S3 event notifications, sends a
+  message as an AWS service principal, allowed by the queue's policy.
 - **`aws:PrincipalIsAWSService` is `false`** for every evaluated principal,
   where v0.5.0 left it absent, and `aws:PrincipalServiceName` is absent
   whatever the request carries (tule.dev/policy v0.4.0). A `Bool` `Deny` on
@@ -326,9 +332,12 @@ Gaps:
   nothing is evaluated). Policies stored by earlier releases are matched by
   ARN until they are written again (see the v0.4.0 changes). A session
   whose role was deleted is refused everything.
-- **Service principals never match.** No Tule caller is a service, so a
-  statement naming `sqs.amazonaws.com` or `sns.amazonaws.com` grants
-  nothing.
+- **Service principals never match on the SQS API; they do on the
+  service send endpoint.** No SQS API caller is a service, so there a
+  statement naming `s3.amazonaws.com` or `sns.amazonaws.com` grants
+  nothing. A Tule service sending as one through
+  [the service send endpoint](#the-service-send-endpoint) is evaluated
+  against such statements.
 - **Event source mappings poll with the credentials functions supplies.**
   The configured key keeps working unchanged; a role's session needs the SQS permissions AWS documents for mappings
   (`sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`),
@@ -778,6 +787,141 @@ curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
 curl -fsS --aws-sigv4 aws:amz:us-east-1:sqs --user test:test \
   -X DELETE http://localhost:9050/_queues/queues
 ```
+
+## The service send endpoint
+
+An internal endpoint, not an AWS API, through which a Tule service sends a
+message to a queue as an AWS service principal, as Amazon S3 sends an event
+notification as `s3.amazonaws.com`. AWS services send to queues this way,
+and the queue's policy must allow the service `sqs:SendMessage`: the S3
+User Guide ("Granting permissions to publish event notification messages
+to a destination") gives the queue policy
+
+```json
+{"Effect": "Allow", "Principal": {"Service": "s3.amazonaws.com"},
+ "Action": ["SQS:SendMessage"], "Resource": "arn:aws:sqs:us-east-1:000000000000:events",
+ "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:s3:*:*:photos"},
+               "StringEquals": {"aws:SourceAccount": "000000000000"}}}
+```
+
+`SendMessage` evaluates the caller's identity, and no caller is a service,
+so a Tule service sends through this endpoint instead. It is
+`POST /_internal/send-message`, modeled on functions' service invoke
+endpoint.
+
+- **Authentication.** SigV4 for the signing name `sqs`, with the root
+  key: the configured `TULE_Auth_AccessKeyID`, or, with identity, a key
+  identity issued the root user of the service's account
+  (`TULE_Queues_AccountID`), the principals that are never evaluated
+  against policies ([Permissions](#permissions)). Any other key, an IAM
+  user's or a role session's whatever its policies allow, is refused as
+  unknown. A refusal is `403` with the sigv4 Kind as the code, such as
+  `MissingAuth`, `UnknownAccessKey`, `SignatureMismatch` or
+  `WrongService`, as identity's internal endpoints refuse one. A missing
+  or malformed signature, the wrong service, and an unknown key are
+  refused before the body is read; the verifier reads the body, up to
+  4 MiB, to hash it before it compares the signature, so
+  `SignatureMismatch` comes after. A key lookup identity fails is `500`
+  `InternalFailure`, and a body over 4 MiB is `413` `RequestTooLarge`. As
+  on every other route, a request signed for any region verifies; the
+  client signs for the service's.
+- **Request.**
+
+  ```json
+  {"QueueArn": "arn:aws:sqs:us-east-1:000000000000:events",
+   "ServicePrincipal": "s3.amazonaws.com",
+   "SourceArn": "arn:aws:s3:::photos", "SourceAccount": "000000000000",
+   "MessageBody": "{\"Records\":[...]}"}
+  ```
+
+  `QueueArn` is the queue's ARN: one of another partition, region or
+  account than the service's names no queue here, and is answered `404`.
+  `ServicePrincipal` is a service principal, DNS labels ending in
+  `.amazonaws.com`, checked as identity's assume-role endpoint checks it.
+  `SourceArn`, an ARN, and `SourceAccount`, 12 digits, are optional: the
+  resource the service acts for and its account, such as a bucket and its
+  owner, checked as identity's assume-role endpoint checks them.
+  `SourceArn` is held to 1024 characters, the longest condition value the
+  service evaluates, though an ARN may be 2048. `MessageBody` is the
+  message, a JSON string, which the queue gets as the characters it
+  decodes to. The body must be UTF-8, and an escaped lone surrogate
+  (`\ud800`), which a JSON decoder would turn into U+FFFD, is refused as an
+  invalid character rather than changed.
+- **Evaluation.** Only the queue's policy is evaluated, with
+  tule.dev/policy's `AuthorizeService`, as a service principal has no
+  identity policies. It must allow the service principal `sqs:SendMessage`
+  on the queue. A `Deny` that applies refuses it, and a queue without a
+  policy, or whose policy names no such service, is refused, standalone
+  or not. A `Service` value matches only the service principal it names
+  exactly. `Principal` `"*"` names a service too, in an `Allow` and a
+  `Deny` alike, and `NotPrincipal` exempts the service it names
+  (tule.dev/policy's `AuthorizeService`), so an `Allow` of `"*"` should
+  carry an `aws:SourceArn` or `aws:SourceAccount` condition, or it lets
+  every service send. `ArnLike` matches each `*` of a pattern against an
+  empty segment too, so the User Guide's `arn:aws:s3:*:*:<bucket>`
+  matches `arn:aws:s3:::<bucket>`. The context is `aws:SourceArn` and
+  `aws:SourceAccount` from the request when given, which "the calling
+  service passes" (IAM User Guide, "AWS global condition context keys");
+  `aws:PrincipalServiceName` and `aws:PrincipalIsAWSService`, which
+  tule.dev/policy sets; `aws:CurrentTime`, `aws:EpochTime`,
+  `aws:SecureTransport` and `aws:RequestedRegion` (the service's own
+  region); and the queue's `aws:ResourceTag/<key>`. `aws:SourceIp` is not
+  supplied: the address is the Tule service's, and the page says
+  network-specific context is redacted on service-to-service calls. The
+  queue's tags and policy are read with its store ID, and the message is
+  sent pinned to it, as an SQS operation is: a queue deleted and created
+  again under its name in between is answered `404`.
+- **Sending.** As `SendMessage` with only a `MessageBody`: the same checks
+  of the characters and of the queue's `MaximumMessageSize`, measured on
+  the body's bytes in UTF-8, not on its escaped form in the request. A
+  FIFO queue needs a message group, which the request cannot carry, so it
+  refuses every message; S3 does not support FIFO queues as event
+  destinations either. The message's `SenderId` is the service principal,
+  such as `s3.amazonaws.com`: AWS does not document what SQS reports for a
+  message an AWS service sent.
+- **Response.** `X-Amzn-RequestId` is the call's own request ID, the one
+  it is logged under. `200` with the message's ID and the MD5 digest of
+  its body, as `SendMessage` answers them:
+
+  ```json
+  {"MessageId": "4144678e-5490-40d3-8660-480927d87d74",
+   "MD5OfMessageBody": "b16471d61bb6f7637a2ae0da893492d5"}
+  ```
+- **Refusals.** `{"Code": "...", "Message": "..."}`, the shape of
+  identity's internal endpoints' errors: `404` `ResourceNotFound` (no such
+  queue, or an ARN of another partition, region or account), `403`
+  `AccessDenied` (the queue policy does not allow the service, with the
+  message SQS's `AccessDenied` carries, with the service principal in
+  place of the caller's ARN), `400` `InvalidRequest` (a body that is not a request, or a
+  malformed field), `400` `InvalidMessage` (the body fails `SendMessage`'s
+  checks, with `SendMessage`'s message), and `413` `RequestTooLarge`. The
+  message's checks come after the evaluation, so a service the queue does
+  not allow learns nothing of them. A failure of the store, or a queue
+  whose policy or tags cannot be evaluated, is `500` `InternalFailure`,
+  logged.
+
+### The service send client
+
+`tule.dev/queues/servicesend` is the endpoint's client:
+
+```go
+c, err := servicesend.New(servicesend.Config{
+	Endpoint:        "http://localhost:9050",
+	Region:          "us-east-1",
+	AccessKeyID:     rootKeyID,
+	SecretAccessKey: rootSecret,
+})
+res, err := c.SendMessage(ctx, queueARN, "s3.amazonaws.com", body,
+	servicesend.WithSourceArn(bucketARN),
+	servicesend.WithSourceAccount(accountID))
+```
+
+`res` carries `RequestID`, `MessageID` and `MD5OfMessageBody`. The body is
+sent as it is, without HTML escaping, and the answer's digest is checked
+against it; a body that is not UTF-8, which JSON cannot carry unchanged, is
+an error before anything is sent. It returns `servicesend.ErrNotFound`,
+`ErrAccessDenied` and `ErrInvalidMessage` for those refusals, and a
+`*servicesend.Error` or a transport error otherwise.
 
 ## Differences from AWS
 
