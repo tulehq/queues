@@ -19,6 +19,7 @@ import (
 	"tule.dev/queues/internal/authz"
 	"tule.dev/queues/internal/contracts"
 	"tule.dev/queues/internal/sqsapi"
+	"tule.dev/queues/servicesend"
 )
 
 const moduleName = "tule/modules/queues"
@@ -123,10 +124,12 @@ func (m *Module) Name() string {
 	return moduleName
 }
 
-// Init registers the module's routes.
+// Init registers the module's routes, the SQS API's and the service-send
+// endpoint's.
 func (m *Module) Init(context.Context) error {
 	m.router.Handle(m, http.MethodPost, rootPath, m.dispatch)
 	m.router.Handle(m, http.MethodPost, queuePath, m.dispatch)
+	m.router.Handle(m, http.MethodPost, servicesend.Path, m.serviceSend)
 	return nil
 }
 

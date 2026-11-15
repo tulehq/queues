@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,7 +15,9 @@ import (
 	"tule.dev/queues/internal/contracts"
 	"tule.dev/queues/internal/modules/health"
 	"tule.dev/queues/internal/modules/inspect"
+	"tule.dev/queues/internal/modules/queues"
 	"tule.dev/queues/internal/sqsapi"
+	"tule.dev/queues/servicesend"
 )
 
 // maxBodySize bounds the request body the verifier buffers to hash it. SQS
@@ -31,14 +34,16 @@ const maxBodySize = 4 * sqsapi.MaxMessageSize
 // variable so a test can shorten it.
 var identityTimeout = 10 * time.Second
 
-// verifiers are the two SigV4 verifiers, one per protocol: a JSON request
-// must sign X-Amz-Target, which names its operation, so a relay cannot turn
-// a signed read into a delete with the same body; a Query request names its
-// operation in the signed body, and an inspection request in the signed
-// method and path.
+// verifiers are the SigV4 verifiers: one per protocol, and one for the
+// service-send endpoint. A JSON request must sign X-Amz-Target, which names
+// its operation, so a relay cannot turn a signed read into a delete with
+// the same body; a Query request names its operation in the signed body,
+// and an inspection request in the signed method and path. The internal
+// one knows only the root principal's keys (rootOnly).
 type verifiers struct {
-	json  *sigv4.Verifier
-	plain *sigv4.Verifier
+	json     *sigv4.Verifier
+	plain    *sigv4.Verifier
+	internal *sigv4.Verifier
 }
 
 // newVerifiers returns the SigV4 verifiers every request but the probes goes
@@ -49,7 +54,9 @@ type verifiers struct {
 // everything, and any other is evaluated against its identity policies.
 // Requests are accepted signed for sqs in any region. The path is
 // canonicalized as every service but S3 signs it, since Query requests go
-// to queue URL paths.
+// to queue URL paths. The internal one, for the service-send endpoint, is
+// built the same way over rootOnly, and answers its failures as identity's
+// internal endpoints answer theirs rather than as SQS errors.
 func newVerifiers(cfg *Config) (*verifiers, error) {
 	account := cfg.Queues.AccountID
 	root, err := sigv4.NewStaticKey(sigv4.StaticKeyConfig{
@@ -95,14 +102,50 @@ func newVerifiers(cfg *Config) (*verifiers, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &verifiers{json: jsonV, plain: plainV}, nil
+	internal, err := sigv4.New(
+		rootOnly{keys: keys, account: account},
+		sigv4.WithBufferedPayload(maxBodySize),
+		sigv4.WithRequiredSignedHeaders("host", "x-amz-date"),
+		sigv4.WithService(servicesend.SigningName),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the service-send verifier: %w", err)
+	}
+	return &verifiers{json: jsonV, plain: plainV, internal: internal}, nil
+}
+
+// rootOnly is the key source of the service-send endpoint: the keys of the
+// root principal only, the principal the authorizer never evaluates
+// (package authz), which is the configured key, or with identity a key
+// identity issued the root user of the service's own account. Any other
+// key is unknown, as identity's internal endpoints, which know the root
+// user's key alone, answer one, so the endpoint refuses it before its body
+// is read.
+type rootOnly struct {
+	keys    sigv4.KeySource
+	account string
+}
+
+func (s rootOnly) SigningKey(ctx context.Context, scope sigv4.Scope) (sigv4.Key, error) {
+	k, err := s.keys.SigningKey(ctx, scope)
+	if err != nil {
+		//nolint:wrapcheck // the key sources' errors are the sentinels the verifier reads
+		return sigv4.Key{}, err
+	}
+	p := k.Principal
+	if !p.Root || p.Type != sigv4.PrincipalTypeAccount || p.AccountID != s.account {
+		return sigv4.Key{}, sigv4.ErrUnknownAccessKey
+	}
+	return k, nil
 }
 
 // verifySignature rejects requests whose SigV4 signature does not verify,
 // and serves the rest as Verify returns them, with the signer's principal
-// in their context and the body the signature covered. A request carrying
-// X-Amz-Target is verified as a JSON request, any other as a Query or
-// inspection request.
+// in their context and the body the signature covered. The service-send
+// endpoint, its path exactly as sent, is verified against the root key alone, its failures answered
+// as identity's internal endpoints answer theirs. Any other request
+// carrying X-Amz-Target is verified as a JSON request, any other as a
+// Query or inspection request.
 //
 // The health probes are exempt, so a container's health check needs no
 // credentials; nothing else is, because any web page the developer has open
@@ -112,6 +155,18 @@ func verifySignature(vs *verifiers) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if isProbe(r.URL.Path) {
 				next.ServeHTTP(w, r)
+				return
+			}
+			// The escaped path, which chi routes on: an encoded variant of
+			// the path, such as /%5Finternal/send-message, decodes to it but
+			// is routed elsewhere, so it is verified as any other request.
+			if r.URL.EscapedPath() == servicesend.Path {
+				verified, err := vs.internal.Verify(r)
+				if err != nil {
+					queues.WriteServiceSendError(w, r, err)
+					return
+				}
+				next.ServeHTTP(w, verified)
 				return
 			}
 			v := vs.plain

@@ -3,6 +3,7 @@ package sqsapi
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -534,12 +535,26 @@ func CheckMoveTaskResults(v *int) (int, error) {
 // CheckQueueARN checks that a parameter is an SQS ARN in form,
 // arn:<partition>:sqs:<region>:<account>:<name>, whichever queue it names.
 func CheckQueueARN(field, arn string) error {
-	parts := strings.SplitN(arn, ":", 6)
-	if len(parts) != 6 || parts[0] != "arn" || parts[2] != "sqs" ||
-		slices.Contains(parts, "") {
+	if _, _, _, _, err := ParseQueueARN(arn); err != nil {
 		return errInvalidValue(field, arn, "Must be an Amazon SQS queue ARN")
 	}
 	return nil
+}
+
+// errNotQueueARN is a string that is not an SQS ARN in form.
+var errNotQueueARN = errors.New("not an Amazon SQS queue ARN")
+
+// ParseQueueARN splits an SQS ARN in form,
+// arn:<partition>:sqs:<region>:<account>:<name>, every part non-empty,
+// whichever queue it names. The name is everything after the fifth colon;
+// whether a queue can have it is CheckQueueName's to say.
+func ParseQueueARN(arn string) (partition, region, account, name string, err error) {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) != 6 || parts[0] != "arn" || parts[2] != "sqs" ||
+		slices.Contains(parts, "") {
+		return "", "", "", "", errNotQueueARN
+	}
+	return parts[1], parts[3], parts[4], parts[5], nil
 }
 
 // CheckTags checks tags as the developer guide's tag quotas give them: keys

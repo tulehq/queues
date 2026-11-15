@@ -277,28 +277,45 @@ func (m *Module) readQueue(
 		return nil, "", err //nolint:wrapcheck // the store's error, logged by ToError
 	}
 	c.pinned = contracts.WithQueuePin(c.Context, t.queue, q.ID)
-	stored := make(map[string]string, len(q.Tags))
-	for k := range q.Tags {
-		lower := strings.ToLower(k)
-		if other, dup := stored[lower]; dup {
-			return nil, "", fmt.Errorf("authorize: queue %s holds tag keys %q and %q, "+
-				"which differ only by case", t.queue, other, k)
-		}
-		stored[lower] = k
+	stored, err := storedTagKeys(t.queue, q.Tags)
+	if err != nil {
+		return nil, "", err
 	}
 	for _, k := range t.tagKeys {
 		if s, ok := stored[strings.ToLower(k)]; ok && s != k {
 			return nil, "", sqsapi.ErrTagKeyCaseCollision(k)
 		}
 	}
-	out := make(map[string][]string, len(ctx)+len(q.Tags))
+	return withResourceTags(ctx, q.Tags), q.Policy, nil
+}
+
+// storedTagKeys returns the queue's tag keys by their lower case, or an
+// error when two of them differ only by case, which would feed one
+// aws:ResourceTag key: such a queue is not evaluated.
+func storedTagKeys(queue string, tags map[string]string) (map[string]string, error) {
+	stored := make(map[string]string, len(tags))
+	for k := range tags {
+		lower := strings.ToLower(k)
+		if other, dup := stored[lower]; dup {
+			return nil, fmt.Errorf("authorize: queue %s holds tag keys %q and %q, "+
+				"which differ only by case", queue, other, k)
+		}
+		stored[lower] = k
+	}
+	return stored, nil
+}
+
+// withResourceTags returns ctx with aws:ResourceTag/<key> for each of the
+// queue's tags.
+func withResourceTags(ctx map[string][]string, tags map[string]string) map[string][]string {
+	out := make(map[string][]string, len(ctx)+len(tags))
 	for k, v := range ctx {
 		out[k] = v
 	}
-	for k, v := range q.Tags {
+	for k, v := range tags {
 		out["aws:ResourceTag/"+k] = []string{v}
 	}
-	return out, q.Policy, nil
+	return out
 }
 
 // checks returns every check a request on t needs: check, its operation's
