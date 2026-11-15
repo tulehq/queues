@@ -30,11 +30,9 @@ import (
 	"tule.dev/queues/internal/app"
 )
 
-// server is the app under test, served by the app's own *http.Server over a
-// real TCP listener: the listener is created here because gas.App.Serve
-// exposes neither the listener nor its port, and everything else is the
-// server gas built from the bound configuration, reached over the network
-// and shut down through gas.App.Stop.
+// server is the app under test, served by gas.App.ServeListener over a real
+// TCP listener on a free port: the server is the one gas built from the bound
+// configuration, reached over the network and shut down through gas.App.Stop.
 type server struct {
 	app      *gas.App
 	listener net.Listener
@@ -139,7 +137,7 @@ func serve(t *testing.T, a *gas.App) *server {
 	}
 
 	go func() {
-		srv.served <- a.Server().Serve(listener)
+		srv.served <- a.ServeListener(listener)
 	}()
 
 	return srv
@@ -172,7 +170,7 @@ func (s *server) Stop(t *testing.T) {
 
 	select {
 	case err := <-s.served:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err != nil {
 			t.Errorf("serve: %v", err)
 		}
 	case <-time.After(clientTimeout):
