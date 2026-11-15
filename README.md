@@ -218,6 +218,13 @@ user or role the policy it needs, such as `sqs:*` on `*`.
   its deduplication ID, as SQS replaces it, where v0.4.0 kept the one it
   was sent with. Messages already in a dead-letter queue keep theirs.
 
+**Changes in v0.6.0.**
+
+- **`aws:PrincipalIsAWSService` is `false`** for every evaluated principal,
+  where v0.5.0 left it absent, and `aws:PrincipalServiceName` is absent
+  whatever the request carries (tule.dev/policy v0.4.0). A `Bool` `Deny` on
+  `aws:PrincipalIsAWSService` being `false` now applies.
+
 Each operation is evaluated as the action and resource the SQS Service
 Authorization Reference gives it (the table is `operationAccess` in
 `internal/modules/queues/access.go`, checked by a test against the
@@ -251,6 +258,9 @@ here), the principal's keys from the attributes identity hands over
 (`aws:PrincipalAccount`, `aws:PrincipalArn`, for a role session its role's
 ARN with the role's path, `aws:userid`, `aws:PrincipalType`, and
 `aws:username` for an IAM user; a request cannot set them),
+`aws:PrincipalIsAWSService` as `false`, which tule.dev/policy v0.4.0 sets
+for every evaluated principal (before it, the key was absent, so a `Bool`
+condition on `false` did not hold), with `aws:PrincipalServiceName` absent,
 `aws:PrincipalTag/<key>` for each of the IAM user's tags or the session's
 role's tags (identity issues no session tags), `aws:PrincipalOrgID` and
 `aws:PrincipalOrgPaths` for a principal whose account is in the
