@@ -169,3 +169,51 @@ func errorType(t *testing.T, body io.Reader) string {
 	}
 	return envelope.Type
 }
+
+func TestStartupQueues(t *testing.T) {
+	env := map[string]string{
+		"TULE_Store_Path":   filepath.Join(t.TempDir(), "startup.db"),
+		"TULE_Store_Queues": "jobs, events.fifo",
+	}
+	srv := startServer(t, env)
+	c := clientFor(srv)
+
+	// Both are there before any CreateQueue, with the defaults; the .fifo
+	// name is a FIFO queue.
+	jobs, events := queueURLOf(t, c, "jobs"), queueURLOf(t, c, "events.fifo")
+	requireEqual(t, queueAttrs(t, c, jobs, "VisibilityTimeout")["VisibilityTimeout"], "30",
+		"startup queue's default visibility timeout")
+	_, isFIFO := queueAttrs(t, c, jobs, "FifoQueue")["FifoQueue"]
+	requireEqual(t, isFIFO, false, "jobs is a standard queue")
+	requireEqual(t, queueAttrs(t, c, events, "FifoQueue")["FifoQueue"], "true",
+		"events.fifo is a FIFO queue")
+	sendFIFO(t, c, events, "first", "g", "d1")
+	requireEqual(t, aws.ToString(receiveOne(t, c, events).Body), "first", "FIFO round trip")
+
+	// A queue that exists is kept as it is: its attributes and its messages.
+	_, err := c.SetQueueAttributes(t.Context(), &sqs.SetQueueAttributesInput{
+		QueueUrl:   aws.String(jobs),
+		Attributes: map[string]string{"VisibilityTimeout": "120"},
+	})
+	requireNoErr(t, err, "set visibility timeout")
+	send(t, c, jobs, "kept")
+	srv.Stop(t)
+
+	srv = startServer(t, env)
+	c = clientFor(srv)
+	jobs = queueURLOf(t, c, "jobs")
+	requireEqual(t, queueAttrs(t, c, jobs, "VisibilityTimeout")["VisibilityTimeout"], "120",
+		"visibility timeout after a restart")
+	requireEqual(t, aws.ToString(receiveOne(t, c, jobs).Body), "kept", "message after a restart")
+
+	list, err := c.ListQueues(t.Context(), &sqs.ListQueuesInput{})
+	requireNoErr(t, err, "list queues")
+	requireEqual(t, len(list.QueueUrls), 2, "queues after a restart")
+}
+
+func queueURLOf(t *testing.T, c *sqs.Client, name string) string {
+	t.Helper()
+	out, err := c.GetQueueUrl(t.Context(), &sqs.GetQueueUrlInput{QueueName: aws.String(name)})
+	requireNoErr(t, err, "get queue URL of "+name)
+	return aws.ToString(out.QueueUrl)
+}

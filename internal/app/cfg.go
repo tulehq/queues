@@ -12,6 +12,7 @@ import (
 
 	"tule.dev/queues/internal/contracts"
 	"tule.dev/queues/internal/services/queues/sqlimpl"
+	"tule.dev/queues/internal/sqsapi"
 )
 
 // hstsSettings configures the Strict-Transport-Security header. It is only
@@ -134,6 +135,9 @@ func bindConfig(store gas.ConfigProvider, env config.Environment) (*Config, erro
 	if err := checkQueues(cfg.Queues); err != nil {
 		return nil, err
 	}
+	if err := checkStartupQueues(cfg.Store.Queues); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
 }
@@ -170,6 +174,20 @@ func checkQueues(q *contracts.QueueSettings) error {
 		return fmt.Errorf("config: Queues.Region %q is not an AWS region name", q.Region)
 	}
 	return checkBaseURL(q.BaseURL)
+}
+
+// checkStartupQueues holds each queue to create at startup to SQS's queue
+// name rules, so a bad name fails the start rather than the first request.
+func checkStartupQueues(names []string) error {
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if _, err := sqsapi.CheckQueueName(name); err != nil {
+			return fmt.Errorf("config: Store.Queues: %q: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func checkBaseURL(base string) error {

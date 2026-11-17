@@ -49,6 +49,7 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 |---|---|---|
 | `TULE_Server_Port` | `9050` | Listen port |
 | `TULE_Store_Path` | `./data/queues.db` (`/data/queues.db` in the image) | The SQLite database file; it and its directory are created if missing |
+| `TULE_Store_Queues` | unset | Comma-separated queues to create at startup, if missing, with the default attributes; a name ending in `.fifo` is a FIFO queue. A queue that exists is kept as it is. A name deleted less than 60 seconds before fails the start |
 | `TULE_Queues_AccountID` | `000000000000` | The account queue URLs and ARNs carry: 12 digits |
 | `TULE_Queues_Region` | `us-east-1` | The region queue ARNs carry |
 | `TULE_Queues_BaseURL` | unset | The scheme and host queue URLs start with, such as `http://queues:9050`: an http or https URL with nothing after the host but `/`. Unset, a queue URL starts with the scheme and `Host` the request came in on |
