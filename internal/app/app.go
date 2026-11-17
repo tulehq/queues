@@ -80,19 +80,11 @@ func createQueues(names []string) func(*gas.ServiceContainer) error {
 		if err != nil {
 			return fmt.Errorf("app: failed to resolve the queue store: %w", err)
 		}
-		ctx := context.Background()
 		for _, name := range names {
 			if name == "" {
 				continue
 			}
-			_, err = store.QueueInfo(ctx, name)
-			if err == nil {
-				continue
-			}
-			if !errors.Is(err, contracts.ErrQueueNotFound) {
-				return fmt.Errorf("app: failed to look up queue %q: %w", name, err)
-			}
-			if err = createStartupQueue(ctx, store, name); err != nil {
+			if err = createStartupQueue(context.Background(), store, name); err != nil {
 				return err
 			}
 		}
@@ -101,6 +93,9 @@ func createQueues(names []string) func(*gas.ServiceContainer) error {
 }
 
 // createStartupQueue creates the queue name with the default attributes.
+// CreateQueue returns a queue that exists when the attributes a request sets
+// match it, and the only one set here, FifoQueue, follows from the name, so
+// an existing queue is returned unchanged.
 func createStartupQueue(ctx context.Context, store contracts.QueueProvider, name string) error {
 	var set map[string]string
 	if strings.HasSuffix(name, sqsapi.FIFOSuffix) {
@@ -116,8 +111,8 @@ func createStartupQueue(ctx context.Context, store contracts.QueueProvider, name
 	switch {
 	case errors.Is(err, contracts.ErrQueueDeletedRecently):
 		return fmt.Errorf("app: failed to create queue %q: a queue of the name was deleted "+
-			"less than %s ago, and SQS refuses the name until then: %w",
-			name, contracts.QueueDeleteWindow, err)
+			"less than %d seconds ago, and the name is refused until then (%w)",
+			name, int(contracts.QueueDeleteWindow.Seconds()), contracts.ErrQueueDeletedRecently)
 	case err != nil:
 		return fmt.Errorf("app: failed to create queue %q: %w", name, err)
 	}

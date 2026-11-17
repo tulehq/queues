@@ -184,7 +184,8 @@ func checkStartupQueues(names []string) error {
 			continue
 		}
 		if _, err := sqsapi.CheckQueueName(name); err != nil {
-			return fmt.Errorf("config: Store.Queues: %q: %w", name, err)
+			return fmt.Errorf("config: Store.Queues: %q is not a queue name: up to 80 letters, "+
+				"digits, hyphens and underscores, with .fifo at the end for a FIFO queue", name)
 		}
 	}
 	return nil
