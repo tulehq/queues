@@ -3,10 +3,13 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gasmod/gas"
@@ -21,6 +24,7 @@ import (
 	"tule.dev/queues/internal/modules/inspect"
 	"tule.dev/queues/internal/modules/queues"
 	"tule.dev/queues/internal/services/queues/sqlimpl"
+	"tule.dev/queues/internal/sqsapi"
 )
 
 // New builds the application from cfg. extra options are applied after the
@@ -60,8 +64,59 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 		return nil, err
 	}
 	installMiddleware(app.Router(), cfg, logger, verifiers, authorizer)
+	app.ReadyFunc(createQueues(cfg.Store.Queues))
 
 	return app, nil
+}
+
+// createQueues returns a ready hook that creates each of names that does not
+// exist yet, with the default attributes, as a FIFO queue when the name ends
+// in .fifo. A queue that exists is kept as it is, its attributes included.
+// Ready hooks run before the server listens, so clients never see the
+// service without them.
+func createQueues(names []string) func(*gas.ServiceContainer) error {
+	return func(sc *gas.ServiceContainer) error {
+		store, err := sc.Resolve[contracts.QueueProvider]()
+		if err != nil {
+			return fmt.Errorf("app: failed to resolve the queue store: %w", err)
+		}
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			if err = createStartupQueue(context.Background(), store, name); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// createStartupQueue creates the queue name with the default attributes.
+// CreateQueue returns a queue that exists when the attributes a request sets
+// match it, and the only one set here, FifoQueue, follows from the name, so
+// an existing queue is returned unchanged.
+func createStartupQueue(ctx context.Context, store contracts.QueueProvider, name string) error {
+	var set map[string]string
+	if strings.HasSuffix(name, sqsapi.FIFOSuffix) {
+		set = map[string]string{contracts.AttrFifoQueue: "true"}
+	}
+	attrs, fifo, err := sqsapi.CheckCreateAttributes(name, set)
+	if err != nil {
+		return fmt.Errorf("app: queue %q: %w", name, err)
+	}
+	_, err = store.CreateQueue(ctx, contracts.CreateQueueInput{
+		Name: name, FIFO: fifo, Attributes: attrs,
+	})
+	switch {
+	case errors.Is(err, contracts.ErrQueueDeletedRecently):
+		return fmt.Errorf("app: failed to create queue %q: a queue of the name was deleted "+
+			"less than %d seconds ago, and the name is refused until then (%w)",
+			name, int(contracts.QueueDeleteWindow.Seconds()), contracts.ErrQueueDeletedRecently)
+	case err != nil:
+		return fmt.Errorf("app: failed to create queue %q: %w", name, err)
+	}
+	return nil
 }
 
 func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {

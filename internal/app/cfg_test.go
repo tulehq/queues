@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +100,24 @@ func TestLoadConfigChecksTheQueueSettings(t *testing.T) {
 	t.Setenv("TULE_Queues_AccountID", "123456789012")
 	if _, err := loadEnvConfig(t, "AKID", "secret"); err != nil {
 		t.Fatalf("load config with valid queue settings: %v", err)
+	}
+}
+
+func TestLoadConfigReadsTheStartupQueues(t *testing.T) {
+	t.Setenv("TULE_Store_Queues", "jobs, events.fifo")
+	cfg, err := loadEnvConfig(t, "AKID", "secret")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if got := cfg.Store.Queues; !slices.Equal(got, []string{"jobs", "events.fifo"}) {
+		t.Errorf("Store.Queues = %q, want jobs and events.fifo", got)
+	}
+
+	for _, bad := range []string{"has space", "dots.in.name", strings.Repeat("q", 81)} {
+		t.Setenv("TULE_Store_Queues", "jobs,"+bad)
+		if _, err := loadEnvConfig(t, "AKID", "secret"); err == nil {
+			t.Errorf("load config with the startup queue %q succeeded", bad)
+		}
 	}
 }
 
