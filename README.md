@@ -82,10 +82,14 @@ When the server begins to shut down, the long polls in flight return at
 once with no messages, so a shutdown does not wait out their 20 seconds.
 Logs go to the console only; there is no log shipping.
 
-**Changes in this version.** The `server started` log line is written once
-the port is bound, with the bound address, such as `[::]:9050`, where it
-gave the configured `0.0.0.0:9050`, and a `tls` field. A server that cannot
-bind its port fails without writing it.
+**Changes in this version.** `TULE_Store_Queues` names queues to create at
+startup, before the server listens, so a test or a compose stack can rely
+on them without calling CreateQueue first ([Configuration](#configuration)).
+
+**Changes in v0.6.1.** The `server started` log line is written once the
+port is bound, with the bound address, such as `[::]:9050`, where it gave
+the configured `0.0.0.0:9050`, and a `tls` field. A server that cannot bind
+its port fails without writing it.
 
 ## Permissions
 
